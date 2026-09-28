@@ -74,6 +74,23 @@ public class GeyserStandaloneBootstrap implements GeyserBootstrap {
     private static final Map<NodePath, String> argsConfigKeys = new HashMap<>();
 
     public static void main(String[] args) {
+        // Must be set before Netty's default allocator is initialized
+        if (System.getProperty("io.netty.allocator.type") == null) {
+            // Netty's default adaptive allocator keeps chunks (of up to 8 MiB each) cached per event loop thread and buffer size
+            // class, and never releases them. Since there are 2 * cores event loop threads per group, bursts such as resource
+            // pack downloads leave gigabytes of direct memory behind on hosts with many cores.
+            // The pooled allocator frees chunks again once they are no longer in use.
+            System.setProperty("io.netty.allocator.type", "pooled");
+
+            // Each arena keeps at least one chunk allocated; Netty defaults to 2 * cores arenas
+            String arenas = String.valueOf(Math.min(8, Runtime.getRuntime().availableProcessors()));
+            if (System.getProperty("io.netty.allocator.numDirectArenas") == null) {
+                System.setProperty("io.netty.allocator.numDirectArenas", arenas);
+            }
+            if (System.getProperty("io.netty.allocator.numHeapArenas") == null) {
+                System.setProperty("io.netty.allocator.numHeapArenas", arenas);
+            }
+        }
         if (System.getProperty("io.netty.leakDetection.level") == null) {
             ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.DISABLED); // Can eat performance
         }
