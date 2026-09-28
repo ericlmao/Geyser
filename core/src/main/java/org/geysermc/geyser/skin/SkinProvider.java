@@ -93,7 +93,9 @@ public class SkinProvider {
     private static final Map<String, CompletableFuture<Cape>> requestedCapes = new ConcurrentHashMap<>();
     private static final Map<String, CompletableFuture<Skin>> requestedSkins = new ConcurrentHashMap<>();
 
-    private static final Map<UUID, SkinGeometry> cachedGeometry = new ConcurrentHashMap<>();
+    private static final Cache<UUID, SkinGeometry> cachedGeometry = CacheBuilder.newBuilder()
+            .expireAfterAccess(1, TimeUnit.HOURS)
+            .build();
 
     /**
      * Citizens NPCs use UUID version 2, while legitimate Minecraft players use version 4, and
@@ -226,7 +228,7 @@ public class SkinProvider {
                 skin = CACHED_BEDROCK_SKINS.getIfPresent(skinId);
                 String capeId = session.getClientData().getCapeId();
                 cape = CACHED_BEDROCK_CAPES.getIfPresent(capeId);
-                geometry = cachedGeometry.getOrDefault(uuid, geometry);
+                geometry = Objects.requireNonNullElse(cachedGeometry.getIfPresent(uuid), geometry);
             }
         }
 
@@ -360,6 +362,10 @@ public class SkinProvider {
                         requestedSkins.remove(textureUrl);
                     });
             requestedSkins.put(textureUrl, future);
+            if (future.isDone()) {
+                // Completed before it was registered, so the removal above already ran; don't leave it behind
+                requestedSkins.remove(textureUrl, future);
+            }
         } else {
             Skin skin = supplySkin(playerId, textureUrl);
             future = CompletableFuture.completedFuture(skin);
@@ -388,6 +394,10 @@ public class SkinProvider {
                         requestedCapes.remove(capeUrl);
                     });
             requestedCapes.put(capeUrl, future);
+            if (future.isDone()) {
+                // Completed before it was registered, so the removal above already ran; don't leave it behind
+                requestedCapes.remove(capeUrl, future);
+            }
         } else {
             Cape cape = supplyCape(capeUrl); // blocking
             future = CompletableFuture.completedFuture(cape);

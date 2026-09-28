@@ -159,8 +159,13 @@ public final class Scoreboard {
         }
 
         var display = objectiveSlots.get(slot);
-        if (display != null && display.objective() != objective) {
-            removedSlots.add(display);
+        if (display != null) {
+            // The replaced display slot must be detached from its objective, even if the same objective is displayed again.
+            // Otherwise it keeps receiving (and holding on to) every new score for as long as the objective exists.
+            display.objective().removeDisplaySlot(display);
+            if (display.objective() != objective) {
+                removedSlots.add(display);
+            }
         }
 
         display = switch (DisplaySlot.slotCategory(slot)) {
@@ -204,6 +209,15 @@ public final class Scoreboard {
             return;
         }
 
+        try {
+            update();
+        } finally {
+            // Always release, otherwise a single failed update stops all future updates while removals keep piling up
+            updateLockActive.set(false);
+        }
+    }
+
+    private void update() {
         List<ScoreInfo> addScores = new ArrayList<>(lastAddScoreCount);
         List<ScoreInfo> removeScores = new ArrayList<>(lastRemoveScoreCount);
 
@@ -285,7 +299,6 @@ public final class Scoreboard {
 
         lastAddScoreCount = addScores.size();
         lastRemoveScoreCount = removeScores.size();
-        updateLockActive.set(false);
     }
 
     private void handleDisplaySlot(DisplaySlot slot, List<ScoreInfo> addScores, List<ScoreInfo> removeScores) {

@@ -750,7 +750,7 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
     /**
      * The thread that will run every game tick.
      */
-    private ScheduledFuture<?> tickThread = null;
+    private volatile ScheduledFuture<?> tickThread = null;
 
     /**
      * The number of ticks that have elapsed since the start of this session
@@ -1279,6 +1279,9 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
 
         // Mark session as closed before cancelling erosion futures
         closed = true;
+        // A login finishing concurrently may have (re-)added this session after it was removed above;
+        // SessionManager drops closed sessions on add, so removing once more after marking closed covers both orders.
+        geyser.getSessionManager().removeSession(this);
         erosionHandler.close();
     }
 
@@ -1347,6 +1350,13 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
      * Called every Minecraft tick.
      */
     protected void tick() {
+        if (closed) {
+            // The tick task can be (re)scheduled after disconnect() already cancelled it, e.g. when the downstream
+            // connection or a ticking state update races the disconnect. Stop it so it doesn't keep the session alive.
+            tickThread.cancel(false);
+            return;
+        }
+
         try {
             pistonCache.tick();
 

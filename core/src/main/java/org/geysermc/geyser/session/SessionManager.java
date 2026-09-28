@@ -57,6 +57,10 @@ public final class SessionManager {
      */
     public void addPendingSession(GeyserSession session) {
         pendingSessions.add(session);
+        if (session.isClosed()) {
+            // Disconnected while being added; don't keep a closed session around
+            pendingSessions.remove(session);
+        }
     }
 
     /**
@@ -65,11 +69,15 @@ public final class SessionManager {
     public void addSession(UUID uuid, GeyserSession session) {
         pendingSessions.remove(session);
         sessions.put(uuid, session);
+        if (session.isClosed()) {
+            // Disconnected while logging in; don't keep a closed session around
+            sessions.remove(uuid, session);
+        }
     }
 
     public void removeSession(GeyserSession session) {
         UUID uuid = session.getPlayerEntity().uuid();
-        if (uuid == null || sessions.remove(uuid) == null) {
+        if (uuid == null || !sessions.remove(uuid, session)) {
             // Connection was likely pending
             pendingSessions.remove(session);
         }

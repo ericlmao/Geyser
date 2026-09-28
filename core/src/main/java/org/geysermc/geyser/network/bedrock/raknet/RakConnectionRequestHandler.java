@@ -89,6 +89,8 @@ public class RakConnectionRequestHandler extends ChannelInboundHandlerAdapter {
         InetSocketAddress address = packet.sender();
         InetSocketAddress clientAddress = ((RakServerChannel) ctx.channel()).getClientAddress(address);
         if (!this.server.onConnectionRequest(address, clientAddress)) {
+            // The request is consumed here and never forwarded, so it has to be released
+            packet.release();
             this.sendConnectionBanned(ctx, address, magicBuf, guid);
         } else {
             ctx.fireChannelRead(msg);
