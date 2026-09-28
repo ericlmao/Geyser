@@ -64,6 +64,18 @@ public final class ScoreboardUpdater extends Thread {
         return updater;
     }
 
+    /**
+     * Scoreboard updates touch session state that is only safe to access on the session's event loop
+     * (e.g. player entity metadata for below-name scores), so they must not run on this thread.
+     */
+    private static void updateScoreboard(GeyserSession session) {
+        session.executeInEventLoop(() -> {
+            if (!session.isClosed()) {
+                session.getWorldCache().getScoreboard().onUpdate();
+            }
+        });
+    }
+
     public void shutdown() {
         shutdown = true;
         this.interrupt();
@@ -97,7 +109,7 @@ public final class ScoreboardUpdater extends Thread {
                         // just making sure that all updates are pushed before giving up control
                         if (oldPps >= FIRST_SCORE_PACKETS_PER_SECOND_THRESHOLD &&
                                 newPps < FIRST_SCORE_PACKETS_PER_SECOND_THRESHOLD) {
-                            session.getWorldCache().getScoreboard().onUpdate();
+                            updateScoreboard(session);
                         }
                     }
                 }
@@ -118,7 +130,7 @@ public final class ScoreboardUpdater extends Thread {
                                     FIRST_MILLIS_BETWEEN_UPDATES;
 
                             if (currentTime - scoreboardSession.lastUpdate >= millisBetweenUpdates) {
-                                worldCache.getScoreboard().onUpdate();
+                                updateScoreboard(session);
                                 scoreboardSession.lastUpdate = currentTime;
 
                                 if (DEBUG_ENABLED && (currentTime - scoreboardSession.lastLog >= 60000)) { // one minute
