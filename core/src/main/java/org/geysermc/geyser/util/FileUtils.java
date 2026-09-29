@@ -140,15 +140,7 @@ public final class FileUtils {
      * @return A byte[] representation of the hash
      */
     public static byte[] calculateSHA256(Path path) {
-        byte[] sha256;
-
-        try {
-            sha256 = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(path));
-        } catch (Exception e) {
-            throw new RuntimeException("Could not calculate pack hash", e);
-        }
-
-        return sha256;
+        return calculateHash(path, "SHA-256");
     }
 
     /**
@@ -158,15 +150,25 @@ public final class FileUtils {
      * @return A byte[] representation of the hash
      */
     public static byte[] calculateSHA1(Path path) {
-        byte[] sha1;
+        return calculateHash(path, "SHA-1");
+    }
 
-        try {
-            sha1 = MessageDigest.getInstance("SHA-1").digest(Files.readAllBytes(path));
+    /**
+     * Hashes the file in small chunks. Reading it into one large array would make the JDK cache an equally large
+     * direct buffer on the calling thread, which for big resource packs adds up across threads.
+     */
+    private static byte[] calculateHash(Path path, String algorithm) {
+        try (InputStream stream = Files.newInputStream(path)) {
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
+            return digest.digest();
         } catch (Exception e) {
             throw new RuntimeException("Could not calculate pack hash", e);
         }
-
-        return sha1;
     }
 
     /**

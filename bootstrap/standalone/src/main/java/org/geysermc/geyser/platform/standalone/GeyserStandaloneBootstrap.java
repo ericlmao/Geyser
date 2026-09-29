@@ -91,6 +91,12 @@ public class GeyserStandaloneBootstrap implements GeyserBootstrap {
                 System.setProperty("io.netty.allocator.numHeapArenas", arenas);
             }
         }
+        if (System.getProperty("jdk.nio.maxCachedBufferSize") == null) {
+            // The JDK caches a temporary direct buffer per thread for reads/writes done through heap arrays, sized to the
+            // largest such request and, by default, without limit. Cap it so large one-off file reads don't pin
+            // megabytes of direct memory on every thread that ever performed one.
+            System.setProperty("jdk.nio.maxCachedBufferSize", String.valueOf(256 * 1024));
+        }
         if (System.getProperty("io.netty.leakDetection.level") == null) {
             ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.DISABLED); // Can eat performance
         }
