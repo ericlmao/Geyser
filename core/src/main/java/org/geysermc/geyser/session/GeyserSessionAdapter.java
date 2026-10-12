@@ -175,8 +175,8 @@ public class GeyserSessionAdapter extends SessionAdapter {
             session.sendMessage("Loading your locale (en_us); if this isn't already downloaded, this may take some time");
         }
 
-        // Download and load the language for the player
-        MinecraftLocale.downloadAndLoadLocale(locale);
+        // Download and load the language for the player, off this event loop
+        MinecraftLocale.downloadAndLoadLocaleAsync(locale);
     }
 
     @Override

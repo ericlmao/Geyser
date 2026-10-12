@@ -361,6 +361,8 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         scheduler.setRemoveOnCancelPolicy(true);
         this.scheduledThread = scheduler;
+        // Unload Java locales no player has used for a while (en_us and the default locale are kept)
+        scheduler.scheduleAtFixedRate(MinecraftLocale::evictIdleLocales, 10, 10, TimeUnit.MINUTES);
 
         if (isReloading) {
             // If we're reloading, the default locale in the config might have changed.
@@ -766,6 +768,7 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
             this.disable();
         }
         LocalSession.shutdownEventLoopGroup();
+        MinecraftLocale.shutdown();
 
         // Disable extensions, fire the shutdown event
         this.eventBus.fire(new GeyserShutdownEvent(this.extensionManager, this.eventBus));
