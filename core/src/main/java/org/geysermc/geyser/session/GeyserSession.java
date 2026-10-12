@@ -1067,6 +1067,8 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
 
         loggingIn = true;
 
+        // The token refresh is several blocking HTTPS calls, so it runs on the blocking executor; the result is
+        // applied on the session's own thread
         CompletableFuture.supplyAsync(() -> {
             JavaAuthManager authManager;
             MinecraftProfile mcProfile;
@@ -1082,16 +1084,16 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
                 mcToken = authManager.getMinecraftToken().getUpToDate();
             } catch (Exception e) {
                 geyser.getLogger().error("Error while attempting to use auth chain for " + bedrockUsername() + "!", e);
-                return Boolean.FALSE;
+                return null;
             }
 
-            protocol = new MinecraftProtocol(
+            MinecraftProtocol javaProtocol = new MinecraftProtocol(
                 new GameProfile(mcProfile.getId(), mcProfile.getName()),
                 mcToken.getToken()
             );
             geyser.saveAuthChain(bedrockUsername(), GeyserImpl.GSON.toJson(JavaAuthManager.toJson(authManager)));
-            return Boolean.TRUE;
-        }).whenComplete((successful, ex) -> {
+            return javaProtocol;
+        }, geyser.blockingExecutor()).whenComplete((javaProtocol, ex) -> ensureInEventLoop(() -> {
             if (this.closed) {
                 return;
             }
@@ -1099,7 +1101,7 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
                 // Thrown outside the parsing above, e.g. while building the protocol or saving the auth chain
                 geyser.getLogger().error("Error while attempting to use auth chain for " + bedrockUsername() + "!", ex);
             }
-            if (ex != null || successful == Boolean.FALSE) {
+            if (ex != null || javaProtocol == null) {
                 // The player is waiting for a spawn packet, so let's spawn them in now to show them forms
                 connect();
                 // Will be cached for after login
@@ -1107,12 +1109,13 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
                 return;
             }
 
+            protocol = javaProtocol;
             try {
                 connectDownstream();
             } catch (Throwable t) {
                 onConnectDownstreamFailure(t);
             }
-        });
+        }));
     }
 
     public void authenticateWithMicrosoftCode() {
@@ -1142,11 +1145,12 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
             onMicrosoftLoginComplete(task);
         } else {
             task.resetRunningFlow();
-            task.performLoginAttempt(offlineAccess, code -> {
+            // The code arrives on an authentication thread; show the form on the session's own thread
+            task.performLoginAttempt(offlineAccess, code -> ensureInEventLoop(() -> {
                 if (!closed) {
                     LoginEncryptionUtils.buildAndShowMicrosoftCodeWindow(this, code);
                 }
-            }).handle((r, e) -> onMicrosoftLoginComplete(task));
+            })).handle((r, e) -> onMicrosoftLoginComplete(task));
         }
     }
 
@@ -1173,20 +1177,32 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
             MinecraftProfile mcProfile = result.getMinecraftProfile().getCached();
             MinecraftToken mcToken = result.getMinecraftToken().getCached();
 
-            this.protocol = new MinecraftProtocol(
+            MinecraftProtocol protocol = new MinecraftProtocol(
                 new GameProfile(mcProfile.getId(), mcProfile.getName()),
                 mcToken.getToken()
             );
 
             try {
-                connectDownstream();
-            } catch (Throwable t) {
-                t.printStackTrace();
+                // The login can complete on an authentication thread; connect from the session's own thread
+                ensureInEventLoop(() -> {
+                    if (closed) {
+                        return;
+                    }
+                    this.protocol = protocol;
+                    try {
+                        connectDownstream();
+                    } catch (Throwable t) {
+                        onConnectDownstreamFailure(t);
+                        return;
+                    }
+
+                    // Save our auth chain for later use
+                    geyser.saveAuthChain(bedrockUsername(), GeyserImpl.GSON.toJson(JavaAuthManager.toJson(result)));
+                });
+            } catch (RejectedExecutionException e) {
+                // The session's event loop is shutting down
                 return false;
             }
-
-            // Save our auth chain for later use
-            geyser.saveAuthChain(bedrockUsername(), GeyserImpl.GSON.toJson(JavaAuthManager.toJson(result)));
             return true;
         }).getNow(false);
     }

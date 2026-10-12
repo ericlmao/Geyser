@@ -106,8 +106,9 @@ public abstract class GeyserModBootstrap implements GeyserBootstrap {
             this.geyserPingPassthrough = new ModPingPassthrough(server, geyserLogger);
         }
 
-        // No need to re-register commands, or try to re-inject
-        if (GeyserImpl.getInstance().isReloading()) {
+        // No need to re-register commands, or try to re-inject (e.g. on /geyser reload).
+        // Gate on state rather than the reload flag: these are cleared when the server stops (see onGeyserDisable)
+        if (this.geyserInjector != null) {
             return;
         }
 
@@ -125,6 +126,18 @@ public abstract class GeyserModBootstrap implements GeyserBootstrap {
     public void onGeyserDisable() {
         if (geyser != null) {
             geyser.disable();
+        }
+
+        if (geyser == null || !geyser.isReloading()) {
+            // Full stop (e.g. integrated server closed), not a /geyser reload:
+            // drop everything that references the server so it can be garbage collected
+            if (geyserInjector != null) {
+                geyserInjector.shutdown();
+                geyserInjector = null;
+            }
+            geyserWorldManager = null;
+            geyserPingPassthrough = null;
+            server = null;
         }
     }
 

@@ -123,8 +123,10 @@ public class GeyserStandaloneLogger extends SimpleTerminalConsole implements Gey
 
     @Override
     public void debug(String message, Object... arguments) {
-        // We can't use the debug call that would format for us as we're using Java's string formatting
-        log.debug(ChatColor.GRAY + String.format(message, arguments));
+        if (log.isDebugEnabled()) {
+            // We can't use the debug call that would format for us as we're using Java's string formatting
+            log.debug(ChatColor.GRAY + String.format(message, arguments));
+        }
     }
 
     @Override

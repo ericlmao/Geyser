@@ -36,6 +36,7 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ReflectiveChannelFactory;
 import io.netty.channel.unix.PreferredDirectByteBufAllocator;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.internal.SystemPropertyUtil;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.geysermc.mcprotocollib.network.helper.NettyHelper;
 import org.geysermc.mcprotocollib.network.netty.MinecraftChannelInitializer;
@@ -52,7 +53,7 @@ import java.util.concurrent.TimeUnit;
  * Manages a Minecraft Java session over our LocalChannel implementations.
  */
 public final class LocalSession extends ClientNetworkSession {
-    private static EventLoopGroup DEFAULT_EVENT_LOOP_GROUP;
+    private static EventLoopGroup DEFAULT_EVENT_LOOP_GROUP; // guarded by LocalSession.class
     private static PreferredDirectByteBufAllocator PREFERRED_DIRECT_BYTE_BUF_ALLOCATOR = null;
 
     private final SocketAddress spoofedRemoteAddress;
@@ -76,13 +77,27 @@ public final class LocalSession extends ClientNetworkSession {
 
     @Override
     protected EventLoopGroup getEventLoopGroup() {
-        if (DEFAULT_EVENT_LOOP_GROUP == null) {
-            DEFAULT_EVENT_LOOP_GROUP = new DefaultEventLoopGroup(new DefaultThreadFactory(this.getClass(), true));
-            Runtime.getRuntime().addShutdownHook(new Thread(
-                () -> DEFAULT_EVENT_LOOP_GROUP.shutdownGracefully(100, 500, TimeUnit.MILLISECONDS)));
-        }
+        return eventLoopGroup();
+    }
 
+    static synchronized EventLoopGroup eventLoopGroup() {
+        if (DEFAULT_EVENT_LOOP_GROUP == null || DEFAULT_EVENT_LOOP_GROUP.isShuttingDown()) {
+            // 0 = Netty default (2 * cores)
+            int threads = SystemPropertyUtil.getInt("io.netty.eventLoopThreads", 0);
+            // Daemon threads, so no JVM shutdown hook (which would pin this classloader on plugin reloads)
+            DEFAULT_EVENT_LOOP_GROUP = new DefaultEventLoopGroup(threads, new DefaultThreadFactory("Geyser LocalSession", true));
+        }
         return DEFAULT_EVENT_LOOP_GROUP;
+    }
+
+    /**
+     * Shuts down the shared event loop group. Called from {@code GeyserImpl.shutdown()}; a later connection recreates it.
+     */
+    public static synchronized void shutdownEventLoopGroup() {
+        if (DEFAULT_EVENT_LOOP_GROUP != null) {
+            DEFAULT_EVENT_LOOP_GROUP.shutdownGracefully(100, 500, TimeUnit.MILLISECONDS);
+            DEFAULT_EVENT_LOOP_GROUP = null;
+        }
     }
 
     @Override

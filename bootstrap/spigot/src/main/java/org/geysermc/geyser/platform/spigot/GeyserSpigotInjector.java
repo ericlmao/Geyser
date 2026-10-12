@@ -32,6 +32,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.EventLoopGroup;
 import io.netty.channel.local.LocalAddress;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import org.bukkit.Bukkit;
@@ -48,6 +49,7 @@ import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.net.InetAddress;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 public class GeyserSpigotInjector extends GeyserInjector {
     /**
@@ -58,6 +60,10 @@ public class GeyserSpigotInjector extends GeyserInjector {
      * Used to uninject ourselves on shutdown.
      */
     private List<ChannelFuture> allServerChannels;
+    /**
+     * The event loop group backing our local server channel; shut down alongside it.
+     */
+    private EventLoopGroup eventLoopGroup;
 
     public GeyserSpigotInjector(boolean isViaVersion) {
         this.isViaVersion = isViaVersion;
@@ -133,7 +139,7 @@ public class GeyserSpigotInjector extends GeyserInjector {
                     }
                 })
                 // Set to MAX_PRIORITY as MultithreadEventLoopGroup#newDefaultThreadFactory which DefaultEventLoopGroup implements does by default
-                .group(new DefaultEventLoopGroup(0, new DefaultThreadFactory("Geyser Spigot connection thread", Thread.MAX_PRIORITY)))
+                .group(this.eventLoopGroup = new DefaultEventLoopGroup(0, new DefaultThreadFactory("Geyser Spigot connection thread", Thread.MAX_PRIORITY)))
                 .localAddress(LocalAddress.ANY))
                 .bind()
                 .syncUninterruptibly();
@@ -194,5 +200,10 @@ public class GeyserSpigotInjector extends GeyserInjector {
             this.allServerChannels = null;
         }
         super.shutdown();
+
+        if (this.eventLoopGroup != null) {
+            this.eventLoopGroup.shutdownGracefully(100, 1000, TimeUnit.MILLISECONDS);
+            this.eventLoopGroup = null;
+        }
     }
 }

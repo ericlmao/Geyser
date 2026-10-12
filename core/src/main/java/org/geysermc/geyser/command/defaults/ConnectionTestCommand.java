@@ -225,7 +225,7 @@ public class ConnectionTestCommand extends GeyserCommand {
                 source.sendMessage("An error occurred while trying to check your connection! Check the console for more information.");
                 geyser.getLogger().error("Error while trying to check your connection!", e);
             }
-        });
+        }, geyser.blockingExecutor());
     }
 
     private void sendLinks(GeyserCommandSource sender) {
