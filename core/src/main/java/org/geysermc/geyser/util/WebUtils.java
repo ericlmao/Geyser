@@ -33,6 +33,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.GeyserLogger;
 
+import javax.naming.NamingException;
 import javax.naming.directory.Attribute;
 import javax.naming.directory.InitialDirContext;
 import java.io.BufferedReader;
@@ -48,6 +49,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -61,7 +63,32 @@ import java.util.zip.ZipFile;
 
 public class WebUtils {
 
-    private static final Path REMOTE_PACK_CACHE = GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("cache").resolve("remote_packs");
+    private static final int CONNECT_TIMEOUT_MS = 10_000;
+    private static final int READ_TIMEOUT_MS = 10_000;
+
+    /**
+     * Suffix of a metadata file written by a forced {@link #downloadRemotePack(String, boolean)} download.
+     * It only replaces the actual metadata once the download is adopted via {@link #promoteRemotePack(String, Path)}.
+     */
+    private static final String PENDING_METADATA_SUFFIX = ".pending";
+
+    private static Path remotePackCache() {
+        // Not a static field so this class can be loaded without a running Geyser instance (e.g. in tests)
+        return GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("cache").resolve("remote_packs");
+    }
+
+    /**
+     * Opens a connection with Geyser's user agent, connect/read timeouts and redirects enabled.
+     * Without explicit timeouts, {@link HttpURLConnection} waits forever on a stalled server.
+     */
+    private static HttpURLConnection openConnection(String reqURL) throws IOException {
+        HttpURLConnection con = (HttpURLConnection) new URL(reqURL).openConnection();
+        con.setRequestProperty("User-Agent", getUserAgent());
+        con.setConnectTimeout(CONNECT_TIMEOUT_MS);
+        con.setReadTimeout(READ_TIMEOUT_MS);
+        con.setInstanceFollowRedirects(true);
+        return con;
+    }
 
     /**
      * Makes a web request to the given URL and returns the body as a string
@@ -121,14 +148,26 @@ public class WebUtils {
      * @param path Location to save on disk as a path
      */
     public static void downloadFile(String reqURL, Path path) {
+        // Download next to the target and move it into place, so concurrent readers never see a partial file
+        Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
         try {
-            HttpURLConnection con = (HttpURLConnection) new URL(reqURL).openConnection();
-            con.setRequestProperty("User-Agent", getUserAgent());
+            HttpURLConnection con = openConnection(reqURL);
             checkResponseCode(con);
-            InputStream in = con.getInputStream();
-            Files.copy(in, path, StandardCopyOption.REPLACE_EXISTING);
+            try (InputStream in = con.getInputStream()) {
+                Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+            }
+            try {
+                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (Exception e) {
             throw new RuntimeException("Unable to download and save file: " + path.toAbsolutePath() + " (" + reqURL + ")", e);
+        } finally {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -138,18 +177,16 @@ public class WebUtils {
      *
      * @param url The URL to check
      * @param force If true, the pack will be downloaded even if it is cached to a separate location.
+     *              The existing cache metadata is left untouched; the download only becomes the cached copy once
+     *              {@link #promoteRemotePack(String, Path)} is called, and should be removed with
+     *              {@link #discardRemotePack(String, Path)} otherwise.
      * @return Path to the downloaded pack file, or null if it was unable to be loaded
      */
     @SuppressWarnings("ResultOfMethodCallIgnored")
     public static @NonNull Path downloadRemotePack(String url, boolean force) throws IOException {
         GeyserLogger logger = GeyserImpl.getInstance().getLogger();
         try {
-            HttpURLConnection con = (HttpURLConnection) new URL(url).openConnection();
-
-            con.setConnectTimeout(10000);
-            con.setReadTimeout(10000);
-            con.setRequestProperty("User-Agent", "Geyser-" + GeyserImpl.getInstance().platformType().platformName() + "/" + GeyserImpl.VERSION);
-            con.setInstanceFollowRedirects(true);
+            HttpURLConnection con = openConnection(url);
 
             int responseCode = con.getResponseCode();
             if (responseCode >= 400) {
@@ -169,9 +206,10 @@ public class WebUtils {
             }
 
             // Ensure remote pack cache dir exists
-            Files.createDirectories(REMOTE_PACK_CACHE);
+            Path remotePackCache = remotePackCache();
+            Files.createDirectories(remotePackCache);
 
-            Path packMetadata = REMOTE_PACK_CACHE.resolve(url.hashCode() + ".metadata");
+            Path packMetadata = remotePackCache.resolve(url.hashCode() + ".metadata");
             Path downloadLocation;
 
             // If we downloaded this pack before, reuse it if the ETag matches.
@@ -181,7 +219,7 @@ public class WebUtils {
                     int cachedSize = Integer.parseInt(metadata.get(0));
                     String cachedEtag = metadata.get(1);
                     long cachedLastModified = Long.parseLong(metadata.get(2));
-                    downloadLocation = REMOTE_PACK_CACHE.resolve(metadata.get(3));
+                    downloadLocation = remotePackCache.resolve(metadata.get(3));
 
                     if (cachedSize == size &&
                             cachedEtag.equals(con.getHeaderField("ETag")) &&
@@ -190,6 +228,8 @@ public class WebUtils {
                         logger.debug("Using cached pack (%s) for %s.".formatted(downloadLocation.getFileName(), url));
                         downloadLocation.toFile().setLastModified(System.currentTimeMillis());
                         packMetadata.toFile().setLastModified(System.currentTimeMillis());
+                        // The body is never read, so the connection cannot be reused
+                        con.disconnect();
                         return downloadLocation;
                     } else {
                         logger.debug("Deleting cached pack/metadata (%s) as it appears to have changed!".formatted(url));
@@ -202,8 +242,10 @@ public class WebUtils {
                 }
             }
 
-            downloadLocation = REMOTE_PACK_CACHE.resolve(url.hashCode() + "_" + System.currentTimeMillis() + ".zip");
-            Files.copy(con.getInputStream(), downloadLocation, StandardCopyOption.REPLACE_EXISTING);
+            downloadLocation = remotePackCache.resolve(url.hashCode() + "_" + System.currentTimeMillis() + ".zip");
+            try (InputStream in = con.getInputStream()) {
+                Files.copy(in, downloadLocation, StandardCopyOption.REPLACE_EXISTING);
+            }
 
             // This needs to match as the client fails to download the pack otherwise
             long downloadSize = Files.size(downloadLocation);
@@ -220,8 +262,10 @@ public class WebUtils {
                     // This can (or should???) contain a zip
                     if (zip.stream().allMatch(name -> name.getName().endsWith(".zip"))) {
                         // Unzip the pack, as that's what we're after
-                        downloadLocation = REMOTE_PACK_CACHE.resolve(url.hashCode() + "_" + System.currentTimeMillis() + "_unzipped.zip");
-                        Files.copy(zip.getInputStream(zip.entries().nextElement()), downloadLocation, StandardCopyOption.REPLACE_EXISTING);
+                        downloadLocation = remotePackCache.resolve(url.hashCode() + "_" + System.currentTimeMillis() + "_unzipped.zip");
+                        try (InputStream in = zip.getInputStream(zip.entries().nextElement())) {
+                            Files.copy(in, downloadLocation, StandardCopyOption.REPLACE_EXISTING);
+                        }
                         shouldDeleteEnclosing = true;
                     }
                 } finally {
@@ -231,12 +275,16 @@ public class WebUtils {
                     }
                 }
             } catch (IOException e) {
+                Files.deleteIfExists(downloadLocation);
                 throw new IllegalArgumentException("Encountered exception while reading downloaded resource pack at url: %s".formatted(url), e);
             }
 
+            // A forced download must not replace the cached copy until it is adopted (see promoteRemotePack);
+            // otherwise the metadata would point at a file that the running pack codec is not using.
+            Path metadataTarget = force ? pendingMetadata(packMetadata) : packMetadata;
             try {
                 Files.write(
-                        packMetadata,
+                        metadataTarget,
                         Arrays.asList(
                                 String.valueOf(size),
                                 con.getHeaderField("ETag"),
@@ -245,10 +293,10 @@ public class WebUtils {
                         ),
                         StandardOpenOption.CREATE,
                         StandardOpenOption.TRUNCATE_EXISTING);
-                packMetadata.toFile().setLastModified(System.currentTimeMillis());
+                metadataTarget.toFile().setLastModified(System.currentTimeMillis());
             } catch (IOException e) {
-                Files.delete(packMetadata);
-                Files.delete(downloadLocation);
+                Files.deleteIfExists(metadataTarget);
+                Files.deleteIfExists(downloadLocation);
                 throw new IllegalStateException("Failed to write cached pack metadata: " + e.getMessage());
             }
 
@@ -263,6 +311,71 @@ public class WebUtils {
         }
     }
 
+    /**
+     * Makes a pack downloaded with {@code force} the cached copy for the given URL, replacing the previous metadata.
+     * The previously cached pack file is not deleted here, as it may still be served to clients; it is cleaned up
+     * once it is no longer referenced (see {@link org.geysermc.geyser.registry.loader.ResourcePackLoader#cleanupRemotePacks()}).
+     *
+     * @param url the url of the pack
+     * @param candidate the path returned by {@link #downloadRemotePack(String, boolean)}
+     * @return whether the metadata now references the candidate
+     */
+    public static boolean promoteRemotePack(String url, Path candidate) {
+        Path packMetadata = remotePackCache().resolve(url.hashCode() + ".metadata");
+        Path pending = pendingMetadata(packMetadata);
+        try {
+            if (!referencesFile(pending, candidate)) {
+                GeyserImpl.getInstance().getLogger().debug("No pending cache metadata for %s (%s); not updating the remote pack cache.".formatted(url, candidate.getFileName()));
+                return false;
+            }
+            Files.move(pending, packMetadata, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            return true;
+        } catch (IOException e) {
+            GeyserImpl.getInstance().getLogger().error("Failed to update cached pack metadata for " + url, e);
+            return false;
+        }
+    }
+
+    /**
+     * Deletes a pack downloaded with {@code force} that was not adopted, together with its pending metadata.
+     * Does nothing if the pack file is the currently cached copy for the URL.
+     *
+     * @param url the url of the pack
+     * @param candidate the path returned by {@link #downloadRemotePack(String, boolean)}
+     */
+    public static void discardRemotePack(String url, Path candidate) {
+        Path remotePackCache = remotePackCache();
+        Path packMetadata = remotePackCache.resolve(url.hashCode() + ".metadata");
+        Path pending = pendingMetadata(packMetadata);
+        try {
+            if (!candidate.toAbsolutePath().normalize().startsWith(remotePackCache.toAbsolutePath().normalize())
+                    || referencesFile(packMetadata, candidate)) {
+                return;
+            }
+            if (referencesFile(pending, candidate)) {
+                Files.deleteIfExists(pending);
+            }
+            Files.deleteIfExists(candidate);
+        } catch (IOException e) {
+            GeyserImpl.getInstance().getLogger().error("Failed to delete unused remote pack " + candidate, e);
+        }
+    }
+
+    private static Path pendingMetadata(Path packMetadata) {
+        return packMetadata.resolveSibling(packMetadata.getFileName() + PENDING_METADATA_SUFFIX);
+    }
+
+    /**
+     * @return whether the given metadata file exists and its pack file entry (4th line) is the given file
+     */
+    private static boolean referencesFile(Path metadata, Path packFile) throws IOException {
+        if (!Files.exists(metadata)) {
+            return false;
+        }
+        List<String> lines = Files.readAllLines(metadata, StandardCharsets.UTF_8);
+        return lines.size() >= 4 && lines.get(3).equals(packFile.getFileName().toString());
+    }
+
 
     /**
      * Post a string to the given URL
@@ -273,16 +386,14 @@ public class WebUtils {
      * @throws IOException If the request fails
      */
     public static String post(String reqURL, String postContent) throws IOException {
-        URL url = new URL(reqURL);
-        HttpURLConnection con = (HttpURLConnection) url.openConnection();
+        HttpURLConnection con = openConnection(reqURL);
         con.setRequestMethod("POST");
         con.setRequestProperty("Content-Type", "text/plain");
-        con.setRequestProperty("User-Agent", getUserAgent());
         con.setDoOutput(true);
 
-        OutputStream out = con.getOutputStream();
-        out.write(postContent.getBytes(StandardCharsets.UTF_8));
-        out.close();
+        try (OutputStream out = con.getOutputStream()) {
+            out.write(postContent.getBytes(StandardCharsets.UTF_8));
+        }
 
         return connectionToString(con);
     }
@@ -344,17 +455,18 @@ public class WebUtils {
      * @throws IOException If the request fails
      */
     public static String postForm(String reqURL, Map<String, String> fields) throws IOException {
-        URL url = new URL(reqURL);
-        HttpURLConnection con = (HttpURLConnection) url.openConnection();
+        HttpURLConnection con = openConnection(reqURL);
         con.setRequestMethod("POST");
         con.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-        con.setRequestProperty("User-Agent", getUserAgent());
         con.setDoOutput(true);
 
         try (OutputStream out = con.getOutputStream()) {
-            // Write the form data to the output
+            // Write the form data to the output. Each part is written separately so that a large value
+            // (e.g. a log file) is not copied into yet another concatenated string.
             for (Map.Entry<String, String> field : fields.entrySet()) {
-                out.write((field.getKey() + "=" + URLEncoder.encode(field.getValue(), StandardCharsets.UTF_8) + "&").getBytes(StandardCharsets.UTF_8));
+                out.write((field.getKey() + "=").getBytes(StandardCharsets.UTF_8));
+                out.write(URLEncoder.encode(field.getValue(), StandardCharsets.UTF_8).getBytes(StandardCharsets.UTF_8));
+                out.write('&');
             }
         }
 
@@ -369,9 +481,10 @@ public class WebUtils {
      * @return The SRV record or null if not found
      */
     public static String @Nullable [] findSrvRecord(GeyserImpl geyser, String remoteAddress) {
+        InitialDirContext ctx = null;
         try {
             // Searches for a server address and a port from a SRV record of the specified host name
-            InitialDirContext ctx = new InitialDirContext();
+            ctx = new InitialDirContext();
             Attribute attr = ctx.getAttributes("dns:///_minecraft._tcp." + remoteAddress, new String[]{"SRV"}).get("SRV");
             // size > 0 = SRV entry found
             if (attr != null && attr.size() > 0) {
@@ -381,6 +494,13 @@ public class WebUtils {
             if (geyser.config().debugMode()) {
                 geyser.getLogger().debug("Exception while trying to find an SRV record for the remote host.");
                 ex.printStackTrace(); // Otherwise we can get a stack trace for any domain that doesn't have an SRV record
+            }
+        } finally {
+            if (ctx != null) {
+                try {
+                    ctx.close();
+                } catch (NamingException ignored) {
+                }
             }
         }
         return null;

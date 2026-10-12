@@ -56,6 +56,7 @@ public class DumpCommand extends GeyserCommand {
 
     private final GeyserImpl geyser;
     private static final String DUMP_URL = "https://dump.geysermc.org/";
+    private static final Object DUMP_LOCK = new Object();
 
     public DumpCommand(GeyserImpl geyser, String name, String description, String permission) {
         super(name, description, permission, TriState.NOT_SET);
@@ -107,8 +108,24 @@ public class DumpCommand extends GeyserCommand {
             }
         }
 
-        AsteriskSerializer.showSensitive = showSensitive;
+        boolean full = showSensitive;
+        boolean offline = offlineDump;
+        boolean logs = addLog;
+        // Collecting and uploading blocks; keep it off the session event loop
+        GeyserImpl.getInstance().blockingExecutor().execute(() -> {
+            // AsteriskSerializer.showSensitive is global, so dumps must not overlap
+            synchronized (DUMP_LOCK) {
+                try {
+                    AsteriskSerializer.showSensitive = full;
+                    dump(source, offline, logs);
+                } finally {
+                    AsteriskSerializer.showSensitive = false;
+                }
+            }
+        });
+    }
 
+    private void dump(GeyserCommandSource source, boolean offlineDump, boolean addLog) {
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
         source.sendMessage(GeyserLocale.getPlayerLocaleString("geyser.commands.dump.collecting", source.locale()));
@@ -127,10 +144,8 @@ public class DumpCommand extends GeyserCommand {
         if (offlineDump) {
             source.sendMessage(GeyserLocale.getPlayerLocaleString("geyser.commands.dump.writing", source.locale()));
 
-            try {
-                FileOutputStream outputStream = new FileOutputStream(GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("dump.json").toFile());
+            try (FileOutputStream outputStream = new FileOutputStream(GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("dump.json").toFile())) {
                 outputStream.write(dumpData.getBytes());
-                outputStream.close();
             } catch (IOException e) {
                 source.sendMessage(ChatColor.RED + GeyserLocale.getPlayerLocaleString("geyser.commands.dump.write_error", source.locale()));
                 geyser.getLogger().error(GeyserLocale.getLocaleStringLog("geyser.commands.dump.write_error_short"), e);

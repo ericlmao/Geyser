@@ -25,6 +25,7 @@
 
 package org.geysermc.geyser.dump;
 
+import com.google.common.base.Utf8;
 import com.google.common.hash.Hashing;
 import com.google.common.io.ByteSource;
 import com.google.common.io.Files;
@@ -68,13 +69,13 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.UnknownHostException;
 import java.nio.charset.Charset;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 @Getter
 public class DumpInfo {
@@ -242,7 +243,7 @@ public class DumpInfo {
             if (AsteriskSerializer.showSensitive) {
                 try (Socket socket = new Socket()) {
                     // This is the most reliable for getting the main local IP
-                    socket.connect(new InetSocketAddress("geysermc.org", 80));
+                    socket.connect(new InetSocketAddress("geysermc.org", 80), 3000);
                     this.internalIP = socket.getLocalAddress().getHostAddress();
                 } catch (IOException e1) {
                     try {
@@ -298,15 +299,29 @@ public class DumpInfo {
     public static class LogsInfo {
         private String link;
 
+        // mclo.gs truncates anything beyond this anyway
+        static final long MAX_LOG_BYTES = 10 * 1024 * 1024;
+        static final int MAX_LOG_LINES = 25_000;
+
         public LogsInfo(GeyserImpl geyser) {
             try {
                 Map<String, String> fields = new HashMap<>();
-                fields.put("content", FileUtils.readAllLines(geyser.getBootstrap().getLogsPath()).collect(Collectors.joining("\n")));
+                fields.put("content", readLog(geyser.getBootstrap().getLogsPath()));
 
                 JsonObject logData = new JsonParser().parse(WebUtils.postForm("https://api.mclo.gs/1/log", fields)).getAsJsonObject();
 
                 this.link = logData.get("url").getAsString();
             } catch (IOException ignored) { }
+        }
+
+        static String readLog(Path path) throws IOException {
+            long size = java.nio.file.Files.size(path);
+            String content = FileUtils.readTail(path, MAX_LOG_BYTES, MAX_LOG_LINES);
+            int length = Utf8.encodedLength(content);
+            if (length < size) {
+                return "[Geyser] log truncated to last " + length + " bytes\n" + content;
+            }
+            return content;
         }
     }
 

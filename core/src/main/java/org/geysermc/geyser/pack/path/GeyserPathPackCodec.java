@@ -39,14 +39,27 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.util.concurrent.TimeUnit;
 
 @RequiredArgsConstructor
 public class GeyserPathPackCodec extends PathPackCodec {
-    private final Path path;
-    private FileTime lastModified;
+    /**
+     * How often the backing file's modification time is re-checked. {@link #size()} is called for every
+     * chunk request, so the stat is throttled instead of being issued on every call.
+     */
+    private static final long LAST_MODIFIED_CHECK_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
-    private byte[] sha256;
-    private long size = -1;
+    private final Path path;
+    private volatile FileTime lastModified;
+    private volatile long lastModifiedCheckNanos;
+
+    /*
+     * These are computed lazily, and should be computed eagerly when the pack is loaded (see ResourcePackLoader),
+     * so that the first client downloading the pack does not hash it on its event loop.
+     * Reads are lock-free; computation is guarded by this instance's monitor.
+     */
+    private volatile byte[] sha256;
+    private volatile long size = -1;
 
     @Override
     public @NonNull Path path() {
@@ -57,24 +70,38 @@ public class GeyserPathPackCodec extends PathPackCodec {
     @Override
     public byte @NonNull [] sha256() {
         this.checkLastModified();
-        if (this.sha256 != null) {
-            return this.sha256;
+        byte[] sha256 = this.sha256;
+        if (sha256 != null) {
+            return sha256;
         }
 
-        return this.sha256 = FileUtils.calculateSHA256(this.path);
+        synchronized (this) {
+            sha256 = this.sha256;
+            if (sha256 == null) {
+                this.sha256 = sha256 = FileUtils.calculateSHA256(this.path);
+            }
+            return sha256;
+        }
     }
 
     @Override
     public long size() {
         this.checkLastModified();
-        if (this.size != -1) {
-            return this.size;
+        long size = this.size;
+        if (size != -1) {
+            return size;
         }
 
-        try {
-            return this.size = Files.size(this.path);
-        } catch (IOException e) {
-            throw new RuntimeException("Could not get file size of path " + this.path, e);
+        synchronized (this) {
+            size = this.size;
+            if (size == -1) {
+                try {
+                    this.size = size = Files.size(this.path);
+                } catch (IOException e) {
+                    throw new RuntimeException("Could not get file size of path " + this.path, e);
+                }
+            }
+            return size;
         }
     }
 
@@ -94,21 +121,33 @@ public class GeyserPathPackCodec extends PathPackCodec {
     }
 
     private void checkLastModified() {
-        try {
-            FileTime lastModified = Files.getLastModifiedTime(this.path);
-            if (this.lastModified == null) {
-                this.lastModified = lastModified;
+        long now = System.nanoTime();
+        if (this.lastModified != null && now - this.lastModifiedCheckNanos < LAST_MODIFIED_CHECK_INTERVAL_NANOS) {
+            return;
+        }
+
+        synchronized (this) {
+            if (this.lastModified != null && now - this.lastModifiedCheckNanos < LAST_MODIFIED_CHECK_INTERVAL_NANOS) {
                 return;
             }
 
-            if (lastModified.toInstant().isAfter(this.lastModified.toInstant())) {
-                GeyserImpl.getInstance().getLogger().warning("Detected a change in the resource pack " + path + ". This is likely to cause undefined behavior for new clients joining. It is suggested you restart Geyser.");
-                this.lastModified = lastModified;
-                this.sha256 = null;
-                this.size = -1;
+            try {
+                FileTime lastModified = Files.getLastModifiedTime(this.path);
+                this.lastModifiedCheckNanos = now;
+                if (this.lastModified == null) {
+                    this.lastModified = lastModified;
+                    return;
+                }
+
+                if (lastModified.toInstant().isAfter(this.lastModified.toInstant())) {
+                    GeyserImpl.getInstance().getLogger().warning("Detected a change in the resource pack " + path + ". This is likely to cause undefined behavior for new clients joining. It is suggested you restart Geyser.");
+                    this.lastModified = lastModified;
+                    this.sha256 = null;
+                    this.size = -1;
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
     }
 }
