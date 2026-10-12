@@ -40,6 +40,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.jetbrains.annotations.Range;
 
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 
@@ -85,7 +86,7 @@ public class PlayerInventory extends Inventory {
     }
 
     public GeyserItemStack getItemInHand() {
-        if (36 + heldItemSlot > this.size) {
+        if (heldItemSlot < 0 || 36 + heldItemSlot >= this.size) {
             GeyserImpl.getInstance().getLogger().debug("Held item slot was larger than expected!");
             return GeyserItemStack.EMPTY;
         }
@@ -93,19 +94,22 @@ public class PlayerInventory extends Inventory {
     }
 
     // TODO other equipment slots
+    /**
+     * @return the equipped items; iterated in {@link EquipmentSlot} declaration order so callers behave deterministically
+     */
     public Map<EquipmentSlot, GeyserItemStack> getEquipment() {
-        return Map.of(
-            EquipmentSlot.MAIN_HAND, getItemInHand(),
-            EquipmentSlot.OFF_HAND, items[45],
-            EquipmentSlot.BOOTS, items[8],
-            EquipmentSlot.LEGGINGS, items[7],
-            EquipmentSlot.CHESTPLATE, items[6],
-            EquipmentSlot.HELMET, items[5]
-        );
+        Map<EquipmentSlot, GeyserItemStack> equipment = new EnumMap<>(EquipmentSlot.class);
+        equipment.put(EquipmentSlot.MAIN_HAND, getItemInHand());
+        equipment.put(EquipmentSlot.OFF_HAND, items[45]);
+        equipment.put(EquipmentSlot.BOOTS, items[8]);
+        equipment.put(EquipmentSlot.LEGGINGS, items[7]);
+        equipment.put(EquipmentSlot.CHESTPLATE, items[6]);
+        equipment.put(EquipmentSlot.HELMET, items[5]);
+        return equipment;
     }
 
     public void setItemInHand(@NonNull GeyserItemStack item) {
-        if (36 + heldItemSlot > this.size) {
+        if (heldItemSlot < 0 || 36 + heldItemSlot >= this.size) {
             GeyserImpl.getInstance().getLogger().debug("Held item slot was larger than expected!");
             return;
         }

@@ -38,6 +38,7 @@ import org.cloudburstmc.protocol.bedrock.packet.SpawnParticleEffectPacket;
 import org.geysermc.geyser.entity.spawn.EntitySpawnContext;
 import org.geysermc.geyser.entity.type.Tickable;
 import org.geysermc.geyser.entity.type.living.MobEntity;
+import org.geysermc.geyser.session.cache.EntityCache;
 import org.geysermc.geyser.util.DimensionUtils;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.type.FloatEntityMetadata;
 import org.geysermc.mcprotocollib.protocol.data.game.entity.metadata.type.IntEntityMetadata;
@@ -147,8 +148,19 @@ public class EnderDragonEntity extends MobEntity implements Tickable {
 
     @Override
     public void despawnEntity() {
-        for (EnderDragonPartEntity part : allParts) {
-            part.despawnEntity();
+        if (allParts != null) {
+            EntityCache entityCache = session.getEntityCache();
+            for (EnderDragonPartEntity part : allParts) {
+                // Despawn the part and drop its EntityCache entries. Part Java ids are deterministic
+                // (entityId + 1..8), so leaving them cached would make the parts of a respawned dragon
+                // be rejected as duplicates and never spawn.
+                // Geyser ids are unique, so this only removes the mapping if it really belongs to this part.
+                if (entityCache.getEntityByGeyserId(part.geyserId()) == part) {
+                    entityCache.removeEntity(part);
+                } else {
+                    part.despawnEntity();
+                }
+            }
         }
         super.despawnEntity();
     }

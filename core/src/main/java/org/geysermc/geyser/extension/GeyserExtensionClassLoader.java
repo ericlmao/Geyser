@@ -25,8 +25,6 @@
 
 package org.geysermc.geyser.extension;
 
-import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.api.extension.Extension;
 import org.geysermc.geyser.api.extension.ExtensionDescription;
@@ -37,12 +35,19 @@ import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class GeyserExtensionClassLoader extends URLClassLoader {
+    static {
+        ClassLoader.registerAsParallelCapable();
+    }
+
     private final GeyserExtensionLoader loader;
     private final GeyserExtensionDescription description;
-    private final Object2ObjectMap<String, Class<?>> classes = new Object2ObjectOpenHashMap<>();
-    private boolean warnedForExternalClassAccess;
+    // Written from other extensions' loaders via GeyserExtensionLoader#classByName
+    private final Map<String, Class<?>> classes = new ConcurrentHashMap<>();
+    private volatile boolean warnedForExternalClassAccess;
 
     public GeyserExtensionClassLoader(GeyserExtensionLoader loader, ClassLoader parent, Path path, GeyserExtensionDescription description) throws MalformedURLException {
         super(new URL[] { path.toUri().toURL() }, parent);
@@ -94,7 +99,7 @@ public class GeyserExtensionClassLoader extends URLClassLoader {
                                 "This can change at any time and break the extension, additionally to potentially causing unexpected behaviour!");
                         warnedForExternalClassAccess = true;
                     }
-                    result = this.loader.classByName(name);
+                    result = this.loader.classByName(name, this);
                 }
             }
 

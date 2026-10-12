@@ -69,4 +69,15 @@ public class EntityEffectCache {
         }
         entityEffects.remove(effect);
     }
+
+    /**
+     * Forgets all effects and their tracked levels; used on dimension switch, after which the server re-sends active effects.
+     */
+    public void clear() {
+        conduitPower = 0;
+        haste = 0;
+        miningFatigue = 0;
+        jumpPower = 0;
+        entityEffects.clear();
+    }
 }

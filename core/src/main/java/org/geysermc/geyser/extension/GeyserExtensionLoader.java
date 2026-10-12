@@ -25,8 +25,6 @@
 
 package org.geysermc.geyser.extension;
 
-import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
-import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import lombok.RequiredArgsConstructor;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.geysermc.api.util.ApiVersion;
@@ -61,6 +59,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -70,8 +69,8 @@ import java.util.regex.Pattern;
 public class GeyserExtensionLoader extends ExtensionLoader {
     private static final Pattern EXTENSION_FILTER = Pattern.compile("^.+\\.jar$");
 
-    private final Object2ObjectMap<String, Class<?>> classes = new Object2ObjectOpenHashMap<>();
-    private final Map<String, GeyserExtensionClassLoader> classLoaders = new HashMap<>();
+    private final Map<String, Class<?>> classes = new ConcurrentHashMap<>();
+    private final Map<String, GeyserExtensionClassLoader> classLoaders = new ConcurrentHashMap<>();
     private final Map<Extension, GeyserExtensionContainer> extensionContainers = new HashMap<>();
     private final Path extensionsDirectory = GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("extensions");
 
@@ -116,7 +115,9 @@ public class GeyserExtensionLoader extends ExtensionLoader {
             return this.setup(extension, description, dataFolder, new GeyserExtensionEventBus(GeyserImpl.getInstance().eventBus(), extension));
         } catch (Throwable e) {
             // if the extension failed to load, remove its classloader and close it.
-            this.classLoaders.remove(description.id()).close();
+            this.classLoaders.remove(description.id());
+            this.classes.values().removeIf(clazz -> clazz.getClassLoader() == loader);
+            loader.close();
             throw e;
         }
     }
@@ -142,24 +143,54 @@ public class GeyserExtensionLoader extends ExtensionLoader {
         return EXTENSION_FILTER;
     }
 
-    public Class<?> classByName(final String name) throws ClassNotFoundException{
+    public Class<?> classByName(final String name) throws ClassNotFoundException {
+        return this.classByName(name, null);
+    }
+
+    /**
+     * @return the class from the first extension that has it, or null; {@code requester} is skipped as it already searched itself
+     */
+    Class<?> classByName(final String name, GeyserExtensionClassLoader requester) {
         Class<?> clazz = this.classes.get(name);
         if (clazz != null) {
             return clazz;
         }
 
         for (GeyserExtensionClassLoader loader : this.classLoaders.values()) {
-            clazz = loader.findClass(name, false);
+            if (loader == requester) {
+                continue;
+            }
+            try {
+                clazz = loader.findClass(name, false);
+            } catch (ClassNotFoundException ignored) {
+                continue;
+            }
             if (clazz != null) {
-                break;
+                return clazz;
             }
         }
 
-        return clazz;
+        return null;
     }
 
     void setClass(String name, final Class<?> clazz) {
         this.classes.putIfAbsent(name, clazz);
+    }
+
+    /**
+     * Closes every extension classloader, releasing the jar handles. Must only be called once all extensions are
+     * disabled and unregistered; already-loaded classes keep working, but no new extension classes can be loaded.
+     */
+    public void shutdown() {
+        for (GeyserExtensionClassLoader loader : this.classLoaders.values()) {
+            try {
+                loader.close();
+            } catch (IOException e) {
+                GeyserImpl.getInstance().getLogger().debug("Failed to close extension classloader: " + e.getMessage());
+            }
+        }
+        this.classLoaders.clear();
+        this.classes.clear();
     }
 
     @Override
@@ -220,7 +251,8 @@ public class GeyserExtensionLoader extends ExtensionLoader {
                 loadOrderGraph.putIfAbsent(id, new ArrayList<>());
             }
 
-            for (GeyserExtensionDescription description : descriptions.values()) {
+            // Iterate a copy: incompatible extensions are removed from descriptions inside the loop
+            for (GeyserExtensionDescription description : new ArrayList<>(descriptions.values())) {
                 for (Map.Entry<String, GeyserExtensionDescription.Dependency> dependency : description.dependencies().entrySet()) {
                     String from = null;
                     String to = null; // Java complains if this isn't initialised, but not from, so, both null.
@@ -320,11 +352,15 @@ public class GeyserExtensionLoader extends ExtensionLoader {
                 // Grab path and description found from before, since we want a custom load order now
                 Path path = extensionPaths.get(id);
                 GeyserExtensionDescription description = descriptions.get(id);
+                if (description == null) {
+                    // Removed above, but still referenced in the load order graph
+                    continue;
+                }
 
                 String name = description.name();
                 if (extensions.containsKey(id) || extensionManager.extension(id) != null) {
                     logger.warning(GeyserLocale.getLocaleStringLog("geyser.extensions.load.duplicate", name, path.toString()));
-                    return;
+                    continue;
                 }
 
                 // Check whether an extensions' requested api version is compatible
@@ -341,7 +377,7 @@ public class GeyserExtensionLoader extends ExtensionLoader {
                             .formatted(name, description.apiVersion()));
                     } else {
                         logger.error(GeyserLocale.getLocaleStringLog("geyser.extensions.load.failed_api_version", name, description.apiVersion()));
-                        return;
+                        continue;
                     }
                 }
 
