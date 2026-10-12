@@ -32,14 +32,17 @@ import org.spongepowered.configurate.yaml.YamlConfigurationLoader;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
+import java.util.Arrays;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
@@ -68,21 +71,9 @@ public final class FileUtils {
      */
     public static File fileOrCopiedFromResource(File file, String name, Function<String, String> format, GeyserBootstrap bootstrap) throws IOException {
         if (!file.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            file.createNewFile();
-            try (FileOutputStream fos = new FileOutputStream(file)) {
-                try (InputStream input = bootstrap.getResourceOrThrow(name)) {
-                    byte[] bytes = new byte[input.available()];
-
-                    //noinspection ResultOfMethodCallIgnored
-                    input.read(bytes);
-
-                    for(char c : format.apply(new String(bytes)).toCharArray()) {
-                        fos.write(c);
-                    }
-
-                    fos.flush();
-                }
+            try (InputStream input = bootstrap.getResourceOrThrow(name)) {
+                String text = format.apply(new String(input.readAllBytes(), StandardCharsets.UTF_8));
+                Files.writeString(file.toPath(), text, StandardCharsets.UTF_8);
             }
         }
 
@@ -109,17 +100,7 @@ public final class FileUtils {
      * @throws IOException if the file failed to write
      */
     public static void writeFile(File file, char[] data) throws IOException {
-        if (!file.exists()) {
-            file.createNewFile();
-        }
-
-        try (FileOutputStream fos = new FileOutputStream(file)) {
-            for (char c : data) {
-                fos.write(c);
-            }
-
-            fos.flush();
-        }
+        Files.writeString(file.toPath(), new String(data), StandardCharsets.UTF_8);
     }
 
     /**
@@ -204,6 +185,84 @@ public final class FileUtils {
         } catch (IOException e) {
             throw new RuntimeException("Error while trying to read file!", e);
         }
+    }
+
+    /**
+     * Reads the end of a file without loading the whole file into memory.
+     * At most the last {@code maxBytes} bytes are read; if the file is larger than that, the (likely partial)
+     * first line of the read region is dropped. The result is then limited to the last {@code maxLines} lines.
+     * Line separators are kept as they are in the file.
+     *
+     * @param path the file to read
+     * @param maxBytes the maximum number of bytes to read from the end of the file
+     * @param maxLines the maximum number of lines to return
+     * @return the tail of the file, decoded as UTF-8; at most {@code maxBytes} bytes (encoded) and {@code maxLines} lines
+     * @throws IOException if the file could not be read
+     */
+    public static String readTail(Path path, long maxBytes, int maxLines) throws IOException {
+        if (maxBytes < 0 || maxLines < 0) {
+            throw new IllegalArgumentException("maxBytes and maxLines must not be negative");
+        }
+
+        byte[] bytes;
+        boolean truncated;
+        try (SeekableByteChannel channel = Files.newByteChannel(path, StandardOpenOption.READ)) {
+            long size = channel.size();
+            long start = Math.max(0, size - Math.min(maxBytes, Integer.MAX_VALUE - 8));
+            truncated = start > 0;
+            channel.position(start);
+            ByteBuffer buffer = ByteBuffer.allocate((int) (size - start));
+            while (buffer.hasRemaining()) {
+                if (channel.read(buffer) == -1) {
+                    break;
+                }
+            }
+            bytes = buffer.array();
+            if (buffer.hasRemaining()) {
+                // File shrank while reading
+                bytes = Arrays.copyOf(bytes, buffer.position());
+            }
+        }
+
+        int from = 0;
+        int end = bytes.length;
+        if (truncated) {
+            // Skip the partial first line
+            int newline = indexOf(bytes, (byte) '\n', 0, end);
+            if (newline != -1) {
+                from = newline + 1;
+            } else {
+                // One very long line; at least don't start in the middle of a UTF-8 sequence
+                while (from < end && (bytes[from] & 0xC0) == 0x80) {
+                    from++;
+                }
+            }
+        }
+
+        if (maxLines == 0) {
+            return "";
+        }
+
+        // Count lines backwards; a trailing line separator terminates the last line rather than starting a new one
+        int lines = 0;
+        int scanEnd = end > from && bytes[end - 1] == '\n' ? end - 1 : end;
+        for (int i = scanEnd - 1; i >= from; i--) {
+            if (bytes[i] == '\n' && ++lines == maxLines) {
+                from = i + 1;
+                break;
+            }
+        }
+
+        return new String(bytes, from, end - from, StandardCharsets.UTF_8);
+    }
+
+    private static int indexOf(byte[] bytes, byte value, int from, int to) {
+        for (int i = from; i < to; i++) {
+            if (bytes[i] == value) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private FileUtils() {
