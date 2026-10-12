@@ -58,6 +58,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -66,6 +67,15 @@ public class SkinManager {
     private static final Map<ResolvableProfile, CompletableFuture<GameProfile>> requestedProfiles = new ConcurrentHashMap<>();
     private static final Cache<ResolvableProfile, GameProfile> RESOLVED_PROFILES_CACHE = CacheBuilder.newBuilder()
         .expireAfterAccess(1, TimeUnit.HOURS)
+        .maximumSize(4096)
+        .build();
+    /**
+     * Profiles that recently failed to resolve. Kept apart from the cache above so a Mojang API failure isn't remembered
+     * as "no textures" for an hour; 10 minutes still keeps unresolvable skulls from running into the API's rate limit.
+     */
+    private static final Cache<ResolvableProfile, Boolean> FAILED_PROFILES = CacheBuilder.newBuilder()
+        .expireAfterWrite(10, TimeUnit.MINUTES)
+        .maximumSize(2048)
         .build();
     private static final UUID EMPTY_UUID = new UUID(0L, 0L);
     static final String GEOMETRY = new String(FileUtils.readAllBytes("bedrock/geometries/geo.json"), StandardCharsets.UTF_8);
@@ -178,6 +188,9 @@ public class SkinManager {
         if (cached != null) {
             return CompletableFuture.completedFuture(cached);
         }
+        if (FAILED_PROFILES.getIfPresent(profile) != null) {
+            return CompletableFuture.completedFuture(partial);
+        }
 
         return requestedProfiles.computeIfAbsent(profile, resolvableProfile -> {
             CompletableFuture<GameProfile> future = (partial.getName() != null
@@ -196,10 +209,21 @@ public class SkinManager {
                             });
                     })
                     .thenApply(resolved -> {
-                        RESOLVED_PROFILES_CACHE.put(resolvableProfile, resolved);
+                        // Lookup failures return the partial profile; only cache profiles that actually resolved
+                        if (resolved != partial && !resolved.getProperties().isEmpty()) {
+                            RESOLVED_PROFILES_CACHE.put(resolvableProfile, resolved);
+                        } else {
+                            FAILED_PROFILES.put(resolvableProfile, Boolean.TRUE);
+                        }
                         return resolved;
                     });
-            return future.whenComplete((r, t) -> requestedProfiles.remove(resolvableProfile));
+            // Async so the removal can never run inside computeIfAbsent's mapping function ("Recursive update")
+            return future.whenCompleteAsync((r, t) -> {
+                if (t != null) {
+                    FAILED_PROFILES.put(resolvableProfile, Boolean.TRUE);
+                }
+                requestedProfiles.remove(resolvableProfile);
+            });
         });
     }
 
@@ -219,7 +243,17 @@ public class SkinManager {
     }
 
     public static void requestAndHandleSkinAndCape(AvatarEntity entity, GeyserSession session, Consumer<SkinProvider.SkinAndCape> skinAndCapeConsumer) {
-        SkinProvider.requestSkinData(entity, session).whenCompleteAsync((skinData, throwable) -> {
+        CompletableFuture<SkinData> future;
+        try {
+            future = SkinProvider.requestSkinData(entity, session);
+        } catch (RejectedExecutionException e) {
+            // The skin executor was shut down (e.g. during a reload); handle it like a failed lookup
+            future = CompletableFuture.failedFuture(e);
+        }
+        future.whenComplete((skinData, throwable) -> session.ensureInEventLoop(() -> {
+            if (session.isClosed() || !entity.isValid()) {
+                return;
+            }
             if (skinData != null && skinData.geometry() != null) {
                 sendSkinPacket(session, entity, skinData);
             }
@@ -227,7 +261,7 @@ public class SkinManager {
             if (skinAndCapeConsumer != null) {
                 skinAndCapeConsumer.accept(skinData == null ? null : new SkinProvider.SkinAndCape(skinData.skin(), skinData.cape()));
             }
-        });
+        }));
     }
 
     public static void handleBedrockSkin(AvatarEntity playerEntity, BedrockClientData clientData) {

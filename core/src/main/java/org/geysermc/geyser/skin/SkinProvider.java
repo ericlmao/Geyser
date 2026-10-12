@@ -36,6 +36,7 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 import org.cloudburstmc.protocol.bedrock.data.skin.ImageData;
 import org.cloudburstmc.protocol.bedrock.data.skin.SerializedSkin;
 import org.geysermc.geyser.GeyserImpl;
+import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.api.event.bedrock.SessionSkinApplyEvent;
 import org.geysermc.geyser.api.network.AuthType;
 import org.geysermc.geyser.api.skin.Cape;
@@ -55,46 +56,89 @@ import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.stream.Stream;
 
 public class SkinProvider {
-    private static ExecutorService EXECUTOR_SERVICE;
+    /**
+     * Only used when there is no Geyser instance to take the blocking executor from (tests).
+     */
+    private static ExecutorService FALLBACK_EXECUTOR;
 
     static final Skin EMPTY_SKIN;
+    /**
+     * Returned for any skin that could not be downloaded. Never stored in {@link #CACHED_JAVA_SKINS}.
+     */
+    static final Skin FAILED_SKIN;
     static final BufferedImage EMPTY_SKIN_IMAGE;
     static final Cape EMPTY_CAPE = new Cape("", "no-cape", ByteArrays.EMPTY_ARRAY, true);
 
+    /*
+     * The texture caches below are JVM-global (they survive reloads) and bounded by bytes, so a burst of unique skins
+     * cannot grow them without limit: about 96 MiB in total at most. A Bedrock player's own skin, cape and geometry
+     * stay cached while they are online, as determineFallbackSkinData touches them on every lookup.
+     */
     private static final Cache<String, Cape> CACHED_JAVA_CAPES = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
+            .maximumWeight(8L * 1024 * 1024)
+            .weigher((String url, Cape cape) -> url.length() + cape.capeData().length + 64)
             .build();
     private static final Cache<String, Skin> CACHED_JAVA_SKINS = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
+            .maximumWeight(32L * 1024 * 1024)
+            .weigher((String url, Skin skin) -> url.length() + skin.skinData().length + 64)
             .build();
 
     private static final Cache<String, Cape> CACHED_BEDROCK_CAPES = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
+            .maximumWeight(8L * 1024 * 1024)
+            .weigher((String capeId, Cape cape) -> capeId.length() + cape.capeData().length + 64)
             .build();
     private static final Cache<String, Skin> CACHED_BEDROCK_SKINS = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
+            .maximumWeight(32L * 1024 * 1024)
+            .weigher((String skinId, Skin skin) -> skinId.length() + skin.skinData().length + 64)
             .build();
 
-    private static final Map<String, CompletableFuture<Cape>> requestedCapes = new ConcurrentHashMap<>();
-    private static final Map<String, CompletableFuture<Skin>> requestedSkins = new ConcurrentHashMap<>();
+    /*
+     * URLs that recently failed to download. Kept apart from the caches above so a transient failure is retried once
+     * the entry expires, instead of pinning the fallback skin to that player.
+     */
+    private static final Cache<String, Boolean> FAILED_SKIN_URLS = CacheBuilder.newBuilder()
+            .expireAfterWrite(2, TimeUnit.MINUTES)
+            .maximumSize(4096)
+            .build();
+    private static final Cache<String, Boolean> FAILED_CAPE_URLS = CacheBuilder.newBuilder()
+            .expireAfterWrite(2, TimeUnit.MINUTES)
+            .maximumSize(4096)
+            .build();
+
+    // In-flight downloads; only ever written through requestInFlight
+    static final Map<String, CompletableFuture<Cape>> requestedCapes = new ConcurrentHashMap<>();
+    static final Map<String, CompletableFuture<Skin>> requestedSkins = new ConcurrentHashMap<>();
 
     private static final Cache<UUID, SkinGeometry> cachedGeometry = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
+            .maximumWeight(16L * 1024 * 1024)
+            .weigher((UUID uuid, SkinGeometry geometry) -> geometry.geometryName().length() + geometry.geometryData().length() + 64)
             .build();
 
     /**
@@ -116,6 +160,9 @@ public class SkinProvider {
     );
 
     static {
+        // Skins and capes are tiny; decode them in memory rather than through a temporary file per image
+        ImageIO.setUseCache(false);
+
         // Generate the empty texture to use as an emergency fallback
         final int pink = 0xFFF800F8;
         final int black = 0xFF000000;
@@ -139,6 +186,7 @@ public class SkinProvider {
             }
         }
         EMPTY_SKIN = new Skin("geysermc:empty", outputStream.toByteArray(), true);
+        FAILED_SKIN = new Skin("empty", EMPTY_SKIN.skinData(), true);
 
         /* Load in the custom skull geometry */
         String skullData = new String(FileUtils.readAllBytes("bedrock/skin/geometry.humanoid.customskull.json"), StandardCharsets.UTF_8);
@@ -165,17 +213,29 @@ public class SkinProvider {
             .build();
     }
 
+    /**
+     * @return Geyser's shared blocking executor, which {@link GeyserImpl} owns and shuts down
+     */
     public static ExecutorService getExecutorService() {
-        if (EXECUTOR_SERVICE == null) {
-            EXECUTOR_SERVICE = Executors.newFixedThreadPool(14);
-        }
-        return EXECUTOR_SERVICE;
+        GeyserImpl geyser = GeyserImpl.getInstance();
+        ExecutorService executor = geyser == null ? null : geyser.blockingExecutor();
+        return executor != null ? executor : fallbackExecutor();
     }
 
-    public static void shutdown() {
-        if (EXECUTOR_SERVICE != null) {
-            EXECUTOR_SERVICE.shutdown();
-            EXECUTOR_SERVICE = null;
+    private static synchronized ExecutorService fallbackExecutor() {
+        if (FALLBACK_EXECUTOR == null) {
+            FALLBACK_EXECUTOR = GeyserImpl.newBlockingExecutor();
+        }
+        return FALLBACK_EXECUTOR;
+    }
+
+    /**
+     * Shuts down only the fallback executor, if one was ever created; the shared executor is left to {@link GeyserImpl}.
+     */
+    public static synchronized void shutdown() {
+        if (FALLBACK_EXECUTOR != null) {
+            FALLBACK_EXECUTOR.shutdown();
+            FALLBACK_EXECUTOR = null;
         }
     }
 
@@ -183,23 +243,34 @@ public class SkinProvider {
         // Schedule Daily Image Expiry if we are caching them
         if (geyser.config().advanced().cacheImages() > 0) {
             geyser.getScheduledThread().scheduleAtFixedRate(() -> {
-                File cacheFolder = GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("cache").resolve("images").toFile();
-                if (!cacheFolder.exists()) {
-                    return;
-                }
-
-                int count = 0;
-                final long expireTime = ((long) GeyserImpl.getInstance().config().advanced().cacheImages()) * ((long)1000 * 60 * 60 * 24);
-                for (File imageFile : Objects.requireNonNull(cacheFolder.listFiles())) {
-                    if (imageFile.lastModified() < System.currentTimeMillis() - expireTime) {
-                        //noinspection ResultOfMethodCallIgnored
-                        imageFile.delete();
-                        count++;
+                // Anything escaping a scheduleAtFixedRate task silently cancels all future runs, so nothing may escape
+                try {
+                    Path cacheFolder = GeyserImpl.getInstance().getBootstrap().getConfigFolder().resolve("cache").resolve("images");
+                    if (!Files.isDirectory(cacheFolder)) {
+                        return;
                     }
-                }
 
-                if (count > 0) {
-                    GeyserImpl.getInstance().getLogger().debug(String.format("Removed %d cached image files as they have expired", count));
+                    int count = 0;
+                    final long expireTime = ((long) GeyserImpl.getInstance().config().advanced().cacheImages()) * ((long)1000 * 60 * 60 * 24);
+                    final long cutoff = System.currentTimeMillis() - expireTime;
+                    // Stream the listing rather than materialising every entry of a large directory at once
+                    try (Stream<Path> files = Files.list(cacheFolder)) {
+                        Iterator<Path> iterator = files.iterator();
+                        while (iterator.hasNext()) {
+                            File imageFile = iterator.next().toFile();
+                            if (imageFile.lastModified() < cutoff) {
+                                //noinspection ResultOfMethodCallIgnored
+                                imageFile.delete();
+                                count++;
+                            }
+                        }
+                    }
+
+                    if (count > 0) {
+                        GeyserImpl.getInstance().getLogger().debug(String.format("Removed %d cached image files as they have expired", count));
+                    }
+                } catch (Throwable t) {
+                    GeyserImpl.getInstance().getLogger().error("Failed to clean image cache", t);
                 }
             }, 10, 1, TimeUnit.DAYS);
         }
@@ -320,7 +391,14 @@ public class SkinProvider {
 
                         return eventSkinData.skinData();
                     } catch (Exception e) {
-                        GeyserImpl.getInstance().getLogger().error(GeyserLocale.getLocaleStringLog("geyser.skin.fail", entity.uuid()), e);
+                        // One line per player rather than a stack trace each, unless debugging
+                        GeyserLogger logger = GeyserImpl.getInstance().getLogger();
+                        String message = GeyserLocale.getLocaleStringLog("geyser.skin.fail", entity.uuid());
+                        if (logger.isDebug()) {
+                            logger.error(message, e);
+                        } else {
+                            logger.warning(message + " (" + e + ")");
+                        }
                     }
 
                     return new SkinData(skinAndCape.skin(), skinAndCape.cape(), null);
@@ -341,6 +419,9 @@ public class SkinProvider {
         }, getExecutorService());
     }
 
+    /**
+     * The returned future never completes exceptionally; a failed download yields {@link #FAILED_SKIN}.
+     */
     static CompletableFuture<Skin> requestSkin(UUID playerId, String textureUrl, boolean newThread) {
         if (textureUrl == null || textureUrl.isEmpty()) return CompletableFuture.completedFuture(EMPTY_SKIN);
         CompletableFuture<Skin> requestedSkin = requestedSkins.get(textureUrl);
@@ -354,26 +435,23 @@ public class SkinProvider {
             return CompletableFuture.completedFuture(cachedSkin);
         }
 
-        CompletableFuture<Skin> future;
-        if (newThread) {
-            future = CompletableFuture.supplyAsync(() -> supplySkin(playerId, textureUrl), getExecutorService())
-                    .whenCompleteAsync((skin, throwable) -> {
-                        CACHED_JAVA_SKINS.put(textureUrl, skin);
-                        requestedSkins.remove(textureUrl);
-                    });
-            requestedSkins.put(textureUrl, future);
-            if (future.isDone()) {
-                // Completed before it was registered, so the removal above already ran; don't leave it behind
-                requestedSkins.remove(textureUrl, future);
-            }
-        } else {
-            Skin skin = supplySkin(playerId, textureUrl);
-            future = CompletableFuture.completedFuture(skin);
-            CACHED_JAVA_SKINS.put(textureUrl, skin);
+        if (FAILED_SKIN_URLS.getIfPresent(textureUrl) != null) {
+            // Failed recently; don't retry until the negative entry expires
+            return CompletableFuture.completedFuture(FAILED_SKIN);
         }
-        return future;
+
+        if (newThread) {
+            return requestInFlight(requestedSkins, textureUrl, url -> supplySkin(playerId, url), url -> FAILED_SKIN, SkinProvider::cacheSkinResult);
+        }
+
+        Skin skin = supplySkin(playerId, textureUrl); // blocking
+        cacheSkinResult(textureUrl, skin);
+        return CompletableFuture.completedFuture(skin);
     }
 
+    /**
+     * The returned future never completes exceptionally; a failed download yields a cape with {@link Cape#failed()} set.
+     */
     private static CompletableFuture<Cape> requestCape(String capeUrl, boolean newThread) {
         if (capeUrl == null || capeUrl.isEmpty()) return CompletableFuture.completedFuture(EMPTY_CAPE);
         CompletableFuture<Cape> requestedCape = requestedCapes.get(capeUrl);
@@ -386,24 +464,79 @@ public class SkinProvider {
             return CompletableFuture.completedFuture(cachedCape);
         }
 
-        CompletableFuture<Cape> future;
-        if (newThread) {
-            future = CompletableFuture.supplyAsync(() -> supplyCape(capeUrl), getExecutorService())
-                    .whenCompleteAsync((cape, throwable) -> {
-                        CACHED_JAVA_CAPES.put(capeUrl, cape);
-                        requestedCapes.remove(capeUrl);
-                    });
-            requestedCapes.put(capeUrl, future);
-            if (future.isDone()) {
-                // Completed before it was registered, so the removal above already ran; don't leave it behind
-                requestedCapes.remove(capeUrl, future);
-            }
-        } else {
-            Cape cape = supplyCape(capeUrl); // blocking
-            future = CompletableFuture.completedFuture(cape);
-            CACHED_JAVA_CAPES.put(capeUrl, cape);
+        if (FAILED_CAPE_URLS.getIfPresent(capeUrl) != null) {
+            // Failed recently; don't retry until the negative entry expires
+            return CompletableFuture.completedFuture(failedCape(capeUrl));
         }
-        return future;
+
+        if (newThread) {
+            return requestInFlight(requestedCapes, capeUrl, SkinProvider::supplyCape, SkinProvider::failedCape, SkinProvider::cacheCapeResult);
+        }
+
+        Cape cape = supplyCape(capeUrl); // blocking
+        cacheCapeResult(capeUrl, cape);
+        return CompletableFuture.completedFuture(cape);
+    }
+
+    /**
+     * Starts the download of {@code url} on the skin executor, or joins the one already in flight. {@code computeIfAbsent}
+     * guarantees a single in-flight future per URL. The returned future never completes exceptionally, and it completes
+     * only after the result has been cached and the in-flight entry removed.
+     */
+    static <T> CompletableFuture<T> requestInFlight(Map<String, CompletableFuture<T>> inFlight, String url, Function<String, T> loader,
+                                                    Function<String, T> onFailure, BiConsumer<String, T> cacheResult) {
+        try {
+            return inFlight.computeIfAbsent(url, key -> CompletableFuture.supplyAsync(() -> loader.apply(key), getExecutorService())
+                    .exceptionally(throwable -> {
+                        debug("Failed to load texture from " + key + ": " + throwable);
+                        return onFailure.apply(key);
+                    })
+                    // This must be async: a synchronous whenComplete could run inside computeIfAbsent's mapping function,
+                    // where removing from the map throws "Recursive update". Running it elsewhere, the removal waits for the
+                    // insert to be published and then removes exactly this entry. The common pool is used instead of the
+                    // skin executor so that a pool shut down between the two stages can't reject this stage.
+                    .whenCompleteAsync((result, throwable) -> {
+                        try {
+                            cacheResult.accept(key, result);
+                        } finally {
+                            inFlight.remove(key);
+                        }
+                    }));
+        } catch (RejectedExecutionException e) {
+            // The skin executor was shut down (e.g. during a reload) after we got it; nothing was registered
+            return CompletableFuture.completedFuture(onFailure.apply(url));
+        }
+    }
+
+    /**
+     * The only place a downloaded Java skin is cached. Failures go to the short-lived negative cache instead, so the
+     * positive cache only ever holds skins with {@code failed() == false}.
+     */
+    static void cacheSkinResult(String url, @Nullable Skin skin) {
+        if (skin == null || skin.failed()) {
+            FAILED_SKIN_URLS.put(url, Boolean.TRUE);
+        } else {
+            CACHED_JAVA_SKINS.put(url, skin);
+        }
+    }
+
+    /**
+     * The only place a downloaded Java cape is cached; see {@link #cacheSkinResult(String, Skin)}.
+     */
+    static void cacheCapeResult(String url, @Nullable Cape cape) {
+        if (cape == null || cape.failed()) {
+            FAILED_CAPE_URLS.put(url, Boolean.TRUE);
+        } else {
+            CACHED_JAVA_CAPES.put(url, cape);
+        }
+    }
+
+    private static void debug(String message) {
+        // Null-safe so the failure paths above can never throw themselves
+        GeyserImpl geyser = GeyserImpl.getInstance();
+        if (geyser != null) {
+            geyser.getLogger().debug(message);
+        }
     }
 
     static void storeBedrockSkin(UUID playerID, String skinId, byte[] skinData) {
@@ -425,26 +558,36 @@ public class SkinProvider {
         try {
             byte[] skin = requestImageData(textureUrl, false);
             return new Skin(textureUrl, skin);
-        } catch (Exception ignored) {} // just ignore I guess
+        } catch (Exception e) {
+            debug("Failed to download skin from " + textureUrl + ": " + e);
+        }
 
-        return new Skin("empty", EMPTY_SKIN.skinData(), true);
+        return FAILED_SKIN;
     }
 
     private static Cape supplyCape(String capeUrl) {
         byte[] cape = EMPTY_CAPE.capeData();
         try {
             cape = requestImageData(capeUrl, true);
-        } catch (Exception ignored) {
-        } // just ignore I guess
-
-        String[] urlSection = capeUrl.split("/"); // A real url is expected at this stage
+        } catch (Exception e) {
+            debug("Failed to download cape from " + capeUrl + ": " + e);
+        }
 
         return new Cape(
                 capeUrl,
-                urlSection[urlSection.length - 1], // get the texture id and use it as cape id
+                capeIdFromUrl(capeUrl),
                 cape,
                 cape.length == 0
         );
+    }
+
+    private static Cape failedCape(String capeUrl) {
+        return new Cape(capeUrl, capeIdFromUrl(capeUrl), EMPTY_CAPE.capeData(), true);
+    }
+
+    private static String capeIdFromUrl(String capeUrl) {
+        String[] urlSection = capeUrl.split("/"); // A real url is expected at this stage
+        return urlSection[urlSection.length - 1]; // get the texture id and use it as cape id
     }
 
     @SuppressWarnings("ResultOfMethodCallIgnored")
@@ -644,7 +787,21 @@ public class SkinProvider {
         con.setConnectTimeout(10000);
         con.setReadTimeout(10000);
 
-        BufferedImage image = ImageIO.read(con.getInputStream());
+        int code = con.getResponseCode();
+        if (code != HttpURLConnection.HTTP_OK) {
+            // Close the error body so the connection can go back to the keep-alive pool instead of lingering until GC
+            InputStream errorStream = con.getErrorStream();
+            if (errorStream != null) {
+                errorStream.close();
+            }
+            throw new IOException("HTTP " + code + " from " + imageUrl);
+        }
+
+        BufferedImage image;
+        // ImageIO.read(InputStream) does not close the stream it is given
+        try (InputStream stream = con.getInputStream()) {
+            image = ImageIO.read(stream);
+        }
 
         if (image == null) {
             throw new IllegalArgumentException("Failed to read image from: %s".formatted(imageUrl));
@@ -702,17 +859,18 @@ public class SkinProvider {
      * @return The converted byte[]
      */
     public static byte[] bufferedImageToImageData(BufferedImage image) {
-        ByteArrayOutputStream outputStream = new ByteArrayOutputStream(image.getWidth() * 4 + image.getHeight() * 4);
-        for (int y = 0; y < image.getHeight(); y++) {
-            for (int x = 0; x < image.getWidth(); x++) {
-                int rgba = image.getRGB(x, y);
-                outputStream.write((rgba >> 16) & 0xFF);
-                outputStream.write((rgba >> 8) & 0xFF);
-                outputStream.write(rgba & 0xFF);
-                outputStream.write((rgba >> 24) & 0xFF);
-            }
+        int width = image.getWidth();
+        int height = image.getHeight();
+        int[] pixels = image.getRGB(0, 0, width, height, null, 0, width);
+        byte[] data = new byte[pixels.length * 4];
+        int index = 0;
+        for (int argb : pixels) {
+            data[index++] = (byte) (argb >> 16); // Red
+            data[index++] = (byte) (argb >> 8); // Green
+            data[index++] = (byte) argb; // Blue
+            data[index++] = (byte) (argb >>> 24); // Alpha
         }
-        return outputStream.toByteArray();
+        return data;
     }
 
     public static <T> T getOrDefault(CompletableFuture<T> future, T defaultValue, int timeoutInSeconds) {

@@ -122,7 +122,13 @@ public class SkullBlockEntityTranslator extends BlockEntityTranslator implements
                 }
                 return;
             }
-            session.ensureInEventLoop(() -> putSkull(session, blockPosition, resolved, blockState));
+            session.ensureInEventLoop(() -> {
+                // Skip if the session closed, or the block changed or its chunk unloaded while the profile resolved
+                if (session.isClosed() || session.getGeyser().getWorldManager().getBlockAt(session, blockPosition) != blockState.javaId()) {
+                    return;
+                }
+                putSkull(session, blockPosition, resolved, blockState);
+            });
         });
 
         // We don't have the textures yet, so we can't determine if a custom block was defined for this skull
