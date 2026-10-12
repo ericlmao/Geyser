@@ -265,6 +265,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Getter
@@ -273,7 +274,10 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
 
     private final GeyserImpl geyser;
     private final UpstreamSession upstream;
-    private DownstreamSession downstream;
+    /**
+     * Written on whichever thread connects to the Java server and read from {@link #disconnect(Component)} on any thread
+     */
+    private volatile DownstreamSession downstream;
     /**
      * The loop where all packets and ticking is processed to prevent concurrency issues.
      * If this is manually called, ensure that any exceptions are properly handled.
@@ -447,8 +451,8 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
     @Setter
     private @Nullable ServerConfigurationJoinInfo serverJoinInfo = null;
 
-    boolean loggedIn;
-    boolean loggingIn;
+    volatile boolean loggedIn;
+    volatile boolean loggingIn;
 
     @Setter
     private boolean spawned;
@@ -456,6 +460,12 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
      * Accessed on the initial Java and Bedrock packet processing threads
      */
     private volatile boolean closed;
+    /**
+     * Set by the first {@link #disconnect(Component)} call, so the teardown runs once even if several threads
+     * disconnect the session at the same time
+     */
+    @Getter(AccessLevel.NONE)
+    private final AtomicBoolean closing = new AtomicBoolean();
 
     private GameMode gameMode = GameMode.SURVIVAL;
 
@@ -812,6 +822,18 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
      */
     private final List<BedrockPacket> queuedImmediatelyPackets = new ArrayList<>();
 
+    private static final long TICK_FAILURE_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(5);
+    /**
+     * When an exception thrown while ticking was last logged, or 0 if never; only used on the session's event loop
+     */
+    @Getter(AccessLevel.NONE)
+    private long lastTickFailureLogNanos;
+    /**
+     * How many exceptions thrown while ticking were not logged since the last one that was
+     */
+    @Getter(AccessLevel.NONE)
+    private int suppressedTickFailures;
+
     /**
      * Stores the book that is currently being read. Used in {@link org.geysermc.geyser.translator.protocol.java.inventory.JavaOpenBookTranslator}
      */
@@ -1033,7 +1055,7 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
         try {
             connectDownstream();
         } catch (Throwable t) {
-            t.printStackTrace();
+            onConnectDownstreamFailure(t);
         }
     }
 
@@ -1073,7 +1095,11 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
             if (this.closed) {
                 return;
             }
-            if (successful == Boolean.FALSE) {
+            if (ex != null) {
+                // Thrown outside the parsing above, e.g. while building the protocol or saving the auth chain
+                geyser.getLogger().error("Error while attempting to use auth chain for " + bedrockUsername() + "!", ex);
+            }
+            if (ex != null || successful == Boolean.FALSE) {
                 // The player is waiting for a spawn packet, so let's spawn them in now to show them forms
                 connect();
                 // Will be cached for after login
@@ -1084,7 +1110,7 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
             try {
                 connectDownstream();
             } catch (Throwable t) {
-                t.printStackTrace();
+                onConnectDownstreamFailure(t);
             }
         });
     }
@@ -1166,9 +1192,23 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
     }
 
     /**
+     * Connecting to the Java server failed before the connection could report it, so nothing else will end the
+     * session; disconnect it now instead of leaving the player on the loading screen.
+     */
+    private void onConnectDownstreamFailure(Throwable t) {
+        geyser.getLogger().error("Failed to connect " + bedrockUsername() + " to the Java server", t);
+        disconnect(GeyserLocale.getPlayerLocaleString("geyser.network.remote.server_offline", locale()));
+    }
+
+    /**
      * After getting whatever credentials needed, we attempt to join the Java server.
      */
     private void connectDownstream() {
+        if (closed) {
+            // Disconnected while authenticating; don't log in to the Java server for a player that already left
+            return;
+        }
+
         SessionLoginEvent loginEvent = new SessionLoginEvent(this, remoteServer, new Object2ObjectOpenHashMap<>());
         GeyserImpl.getInstance().eventBus().fire(loginEvent);
         if (loginEvent.isCancelled()) {
@@ -1178,7 +1218,8 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
             return;
         }
 
-        this.cookies = loginEvent.cookies();
+        // Copy, as the Java server can store more cookies and an extension may have supplied an immutable map
+        this.cookies = new Object2ObjectOpenHashMap<>(loginEvent.cookies());
         // Don't allow changing the remote server when it's not up to us
         // Just imagine the chaos of using an integrated world manager for an external server :)
         this.remoteServer = this.geyser.platformType() == PlatformType.STANDALONE ? loginEvent.remoteServer() : remoteServer;
@@ -1238,19 +1279,41 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
         disconnect(Component.text(reason));
     }
 
+    /**
+     * Disconnects both the Bedrock and Java connections and removes this session. Safe to call from any thread and
+     * any number of times; only the first call does anything. When this returns, the session is marked closed, no
+     * longer registered and no longer ticking, even if part of the teardown failed.
+     */
     public void disconnect(Component reason) {
-        if (!closed) {
+        if (!closing.compareAndSet(false, true)) {
+            // Another call is tearing this session down, or already did
+            return;
+        }
+
+        try {
             loggedIn = false;
 
             SessionDisconnectEvent disconnectEvent = new SessionDisconnectEventImpl(this, reason);
             if (authData != null && clientData != null) { // can occur if player disconnects before Bedrock auth finishes
                 // Fire SessionDisconnectEvent
-                geyser.getEventBus().fire(disconnectEvent);
+                try {
+                    geyser.getEventBus().fire(disconnectEvent);
+                } catch (Throwable t) {
+                    geyser.getLogger().error("Error while firing the disconnect event for " + bedrockUsername(), t);
+                }
             }
 
+            // Mark the session as closed before looking at the Java connection. GeyserSessionAdapter#connected checks
+            // this flag after the connection's channel is set, so either it sees the session closed or we see the
+            // connection open below; a Java connection that is still being made can't slip through unclosed.
+            closed = true;
+
             // Disconnect downstream if necessary
+            DownstreamSession downstream = this.downstream;
             if (downstream != null) {
-                // No need to disconnect if already closed
+                // No need to disconnect if already closed. This is also the case while the connection to the Java
+                // server is still being made: disconnecting then would not close it once it is made, so
+                // GeyserSessionAdapter#connected closes it instead.
                 if (!downstream.isClosed()) {
                     downstream.disconnect(reason);
                 }
@@ -1263,27 +1326,32 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
 
             // Disconnect upstream if necessary
             if (!upstream.isClosed()) {
-                upstream.disconnect(disconnectEvent.disconnectReason());
+                try {
+                    upstream.disconnect(disconnectEvent.disconnectReason());
+                } catch (IllegalStateException ignored) {
+                    // The Bedrock session closed in the meantime
+                }
             }
-
-            // Remove from session manager
-            geyser.getSessionManager().removeSession(this);
             // Don't cancel any pending Microsoft auth here - the whole point of PendingMicrosoftAuthentication
             // is to let mobile users disconnect to finish auth in the browser. Task cleans up on timeout.
+        } catch (Throwable t) {
+            geyser.getLogger().error("Error while disconnecting " + bedrockUsername(), t);
+        } finally {
+            closed = true;
+
+            ScheduledFuture<?> tickThread = this.tickThread;
+            if (tickThread != null) {
+                tickThread.cancel(false);
+            }
+
+            // Remove from session manager. This happens after marking the session closed: a login finishing
+            // concurrently may add it again, and SessionManager drops sessions that are closed when added.
+            geyser.getSessionManager().removeSession(this);
+
+            // Packets queued for after the start game packet will never be sent
+            upstream.release();
+            erosionHandler.close();
         }
-
-        if (tickThread != null) {
-            tickThread.cancel(false);
-        }
-
-        queuedImmediatelyPackets.clear();
-
-        // Mark session as closed before cancelling erosion futures
-        closed = true;
-        // A login finishing concurrently may have (re-)added this session after it was removed above;
-        // SessionManager drops closed sessions on add, so removing once more after marking closed covers both orders.
-        geyser.getSessionManager().removeSession(this);
-        erosionHandler.close();
     }
 
     /**
@@ -1362,6 +1430,36 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
         } catch (Throwable e) {
             geyser.getLogger().error("Error thrown in " + this.bedrockUsername() + "'s event loop!", e);
         }
+    }
+
+    private void flushQueuedImmediatelyPackets() {
+        if (queuedImmediatelyPackets.isEmpty()) {
+            return;
+        }
+        BedrockPacket[] packets = queuedImmediatelyPackets.toArray(new BedrockPacket[0]);
+        queuedImmediatelyPackets.clear();
+        try {
+            this.upstream.getSession().getPeer().sendPacketsImmediately(0, 0, packets);
+        } catch (Throwable throwable) {
+            logTickFailure(throwable);
+        }
+    }
+
+    /**
+     * Logs an exception thrown while ticking. A failing tick usually fails again on every following tick, so this
+     * logs at most once every {@link #TICK_FAILURE_LOG_INTERVAL_NANOS} and counts the rest. Only called on the
+     * session's event loop.
+     */
+    private void logTickFailure(Throwable throwable) {
+        long now = System.nanoTime();
+        if (lastTickFailureLogNanos != 0 && now - lastTickFailureLogNanos < TICK_FAILURE_LOG_INTERVAL_NANOS) {
+            suppressedTickFailures++;
+            return;
+        }
+        String suppressed = suppressedTickFailures > 0 ? " (" + suppressedTickFailures + " more since the last one were not logged)" : "";
+        lastTickFailureLogNanos = now;
+        suppressedTickFailures = 0;
+        geyser.getLogger().error("Exception while ticking " + bedrockUsername() + suppressed, throwable);
     }
 
     /**
@@ -1449,16 +1547,17 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
                 }
             }
 
+            this.worldCache.tick();
             this.bundleCache.tick();
             this.dialogManager.tick();
             this.waypointCache.tick();
 
-            this.upstream.getSession().getPeer().sendPacketsImmediately(0, 0, queuedImmediatelyPackets.toArray(new BedrockPacket[0]));
-            queuedImmediatelyPackets.clear();
-
             CooldownUtils.tickCooldown(this);
         } catch (Throwable throwable) {
-            throwable.printStackTrace();
+            logTickFailure(throwable);
+        } finally {
+            // Send whatever was queued this tick even if part of the tick failed; otherwise the queue would only grow
+            flushQueuedImmediatelyPackets();
         }
 
         ticks++;

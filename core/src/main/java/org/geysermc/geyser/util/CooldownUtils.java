@@ -57,7 +57,11 @@ public class CooldownUtils {
         if (sessionPreference == CooldownType.DISABLED) return;
 
         if (session.getAttackSpeed() == 0.0 || session.getAttackSpeed() > 20) {
-            clearCooldown(session); // Let's clear in the off chance there is something already displayed
+            if (session.isNeedAttackCooldownClear()) {
+                // Let's clear in the off chance there is something already displayed. Only once, as clearing every
+                // tick would also wipe any title the server shows
+                clearCooldown(session);
+            }
             return; // 0.0 usually happens on login and causes issues with visuals; anything above 20 means a plugin like OldCombatMechanics is being used
         }
 
