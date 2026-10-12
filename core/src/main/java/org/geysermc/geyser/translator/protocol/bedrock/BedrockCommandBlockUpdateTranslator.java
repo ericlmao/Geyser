@@ -26,6 +26,8 @@
 package org.geysermc.geyser.translator.protocol.bedrock;
 
 import org.cloudburstmc.protocol.bedrock.packet.CommandBlockUpdatePacket;
+import org.geysermc.geyser.entity.type.CommandBlockMinecartEntity;
+import org.geysermc.geyser.entity.type.Entity;
 import org.geysermc.geyser.session.GeyserSession;
 import org.geysermc.geyser.translator.protocol.PacketTranslator;
 import org.geysermc.geyser.translator.protocol.Translator;
@@ -55,9 +57,13 @@ public class BedrockCommandBlockUpdateTranslator extends PacketTranslator<Comman
                     packet.getBlockPosition(), command, mode, outputTracked, isConditional, automatic);
             session.sendDownstreamGamePacket(commandBlockPacket);
         } else {
+            Entity minecart = session.getEntityCache().getEntityByGeyserId(packet.getMinecartRuntimeEntityId());
+            if (!(minecart instanceof CommandBlockMinecartEntity)) {
+                // Unknown or despawned entity, or not a command block minecart; nothing to forward
+                return;
+            }
             ServerboundSetCommandMinecartPacket commandMinecartPacket = new ServerboundSetCommandMinecartPacket(
-                    session.getEntityCache().getEntityByGeyserId(packet.getMinecartRuntimeEntityId()).getEntityId(),
-                    command, outputTracked
+                    minecart.getEntityId(), command, outputTracked
             );
             session.sendDownstreamGamePacket(commandMinecartPacket);
         }

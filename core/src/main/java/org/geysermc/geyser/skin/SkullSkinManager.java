@@ -33,7 +33,7 @@ import org.geysermc.geyser.session.GeyserSession;
 import org.geysermc.geyser.util.PlayerListUtils;
 
 import java.awt.Color;
-import java.util.function.BiConsumer;
+import java.util.Objects;
 import java.util.function.Consumer;
 
 public class SkullSkinManager extends SkinManager {
@@ -57,7 +57,13 @@ public class SkullSkinManager extends SkinManager {
     }
 
     public static void requestAndHandleSkin(SkullPlayerEntity entity, GeyserSession session, Consumer<Skin> skinConsumer) {
-        BiConsumer<Skin, Throwable> applySkin = (skin, throwable) -> {
+        String skinUrl = entity.getSkinUrl();
+        SkinProvider.requestSkin(entity.uuid(), skinUrl, true).whenComplete((skin, throwable) -> session.ensureInEventLoop(() -> {
+            // Skip if the session closed, the skull entity was freed, or it moved on to another skin meanwhile
+            if (skin == null || session.isClosed() || !entity.isValid() || !Objects.equals(skinUrl, entity.getSkinUrl())) {
+                return;
+            }
+
             SerializedSkin serializedSkin = buildSkullEntryManually(session, skin.textureUrl(), skin.skinData());
             // Since 1.21.130: PlayerSkinPacket only works if player entity is listed
             PlayerListUtils.sendSkinUsingPlayerList(session, PlayerListUtils.forSkullPlayerEntity(entity, serializedSkin), entity, false);
@@ -65,10 +71,7 @@ public class SkullSkinManager extends SkinManager {
             if (skinConsumer != null) {
                 skinConsumer.accept(skin);
             }
-        };
-
-        SkinProvider.requestSkin(entity.uuid(), entity.getSkinUrl(), true)
-            .whenCompleteAsync(applySkin);
+        }));
     }
 
 }

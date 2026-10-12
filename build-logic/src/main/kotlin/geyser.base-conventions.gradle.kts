@@ -25,6 +25,18 @@ dependencies {
     compileOnly("org.checkerframework:checker-qual:" + libs.checker.qual.get().version)
 }
 
+// Use the patched Cloudburst networking artifacts (see patches/README.md) wherever the upstream ones would be resolved
+configurations.configureEach {
+    resolutionStrategy.dependencySubstitution {
+        substitute(module("org.cloudburstmc.protocol:bedrock-connection"))
+            .using(project(":patched-protocol-connection"))
+            .because("Bounded outbound queues and reliable teardown")
+        substitute(module("org.cloudburstmc.netty:netty-transport-raknet"))
+            .using(project(":patched-network-raknet"))
+            .because("Bounded outbound queues and reliable teardown")
+    }
+}
+
 repositories {
     // mavenLocal()
 

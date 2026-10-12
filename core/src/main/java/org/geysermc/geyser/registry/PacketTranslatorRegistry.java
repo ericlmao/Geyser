@@ -94,7 +94,6 @@ public class PacketTranslatorRegistry<T> extends AbstractMappedRegistry<Class<? 
             GeyserImpl.getInstance().getLogger().debug("Caught ErosionCancellationException");
         } catch (Throwable ex) {
             GeyserImpl.getInstance().getLogger().error(GeyserLocale.getLocaleStringLog("geyser.network.translator.packet.failed", packet.getClass().getSimpleName()), ex);
-            ex.printStackTrace();
         }
     }
 

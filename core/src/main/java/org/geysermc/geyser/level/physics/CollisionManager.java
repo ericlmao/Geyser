@@ -51,10 +51,7 @@ import org.geysermc.geyser.translator.collision.OtherCollision;
 import org.geysermc.geyser.translator.collision.SolidCollision;
 import org.geysermc.geyser.translator.collision.fixes.ScaffoldingCollision;
 import org.geysermc.geyser.util.BlockUtils;
-
-import java.text.DecimalFormat;
-import java.text.DecimalFormatSymbols;
-import java.util.Locale;
+import org.geysermc.geyser.util.MathUtils;
 
 public class CollisionManager {
     public static final BlockCollision SOLID_COLLISION = new SolidCollision(null);
@@ -88,11 +85,6 @@ public class CollisionManager {
      * This check doesn't allow players right up against the block, so they must be pushed slightly away.
      */
     public static final double COLLISION_TOLERANCE = 0.00001;
-    /**
-     * Trims Y coordinates when jumping to prevent rounding issues being sent to the server.
-     * The locale used is necessary so other regions don't use <code>,</code> as their decimal separator.
-     */
-    private static final DecimalFormat DECIMAL_FORMAT = new DecimalFormat("#.#####", new DecimalFormatSymbols(Locale.ENGLISH));
 
     private static final double PLAYER_STEP_UP = 0.6;
 
@@ -220,7 +212,7 @@ public class CollisionManager {
 
         if (!newOnGround) {
             // Trim the position to prevent rounding errors that make Java think we are clipping into a block
-            position = Vector3d.from(position.getX(), Double.parseDouble(DECIMAL_FORMAT.format(position.getY())), position.getZ());
+            position = Vector3d.from(position.getX(), MathUtils.roundToFiveDecimals(position.getY()), position.getZ());
         }
 
         return new CollisionResult(position, TriState.byBoolean(onGround));
@@ -385,6 +377,9 @@ public class CollisionManager {
     }
 
     private double computeCollisionOffset(BoundingBox boundingBox, Axis axis, double offset, BlockPositionIterator iter, boolean checkWorld, boolean walkOnLava) {
+        PistonCache pistonCache = session.getPistonCache();
+        // PistonCache#computeCollisionOffset returns the offset unchanged when no block is moving, so skip the lookup (and Vector3i allocation)
+        boolean checkPistons = !pistonCache.getMovingBlocksMap().isEmpty();
         for (iter.reset(); iter.hasNext(); iter.next()) {
             int x = iter.getX();
             int y = iter.getY();
@@ -397,7 +392,9 @@ public class CollisionManager {
                     offset = blockCollision.computeCollisionOffset(x, y, z, boundingBox, axis, offset);
                 }
             }
-            offset = session.getPistonCache().computeCollisionOffset(Vector3i.from(x, y, z), boundingBox, axis, offset);
+            if (checkPistons) {
+                offset = pistonCache.computeCollisionOffset(Vector3i.from(x, y, z), boundingBox, axis, offset);
+            }
             if (Math.abs(offset) < COLLISION_TOLERANCE) {
                 return 0;
             }

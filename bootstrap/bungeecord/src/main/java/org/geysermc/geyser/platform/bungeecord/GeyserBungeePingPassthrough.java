@@ -46,6 +46,7 @@ import java.net.SocketAddress;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @AllArgsConstructor
 public class GeyserBungeePingPassthrough implements IGeyserPingPassthrough, Listener {
@@ -67,6 +68,11 @@ public class GeyserBungeePingPassthrough implements IGeyserPingPassthrough, List
 
         try {
             event = future.get(100, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // Expected under a slow ProxyPingEvent listener; logging at error with a stack trace floods the log under a ping storm
+            String address = GeyserImpl.getInstance().config().logPlayerIpAddresses() ? inetSocketAddress.toString() : "<IP address withheld>";
+            GeyserImpl.getInstance().getLogger().debug("Timed out getting ping information for " + address);
+            return null;
         } catch (Throwable cause) {
             String address = GeyserImpl.getInstance().config().logPlayerIpAddresses() ? inetSocketAddress.toString() : "<IP address withheld>";
             GeyserImpl.getInstance().getLogger().error("Failed to get ping information for " + address, cause);

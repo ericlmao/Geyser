@@ -79,6 +79,11 @@ public class GeyserPistonListener implements Listener {
             return;
         }
 
+        if (geyser.getSessionManager().size() == 0) {
+            // No Bedrock players; nothing to translate
+            return;
+        }
+
         World world = event.getBlock().getWorld();
         boolean isExtend = event instanceof BlockPistonExtendEvent;
 
@@ -89,6 +94,7 @@ public class GeyserPistonListener implements Listener {
 
         Object2ObjectMap<Vector3i, BlockState> attachedBlocks = new Object2ObjectArrayMap<>();
         boolean blocksFilled = false;
+        Direction orientation = null;
 
         for (Map.Entry<UUID, GeyserSession> entry : geyser.getSessionManager().getSessions().entrySet()) {
             Player player = Bukkit.getPlayer(entry.getKey());
@@ -116,17 +122,19 @@ public class GeyserPistonListener implements Listener {
                         attachedBlocks.put(getVector(attachedLocation), state);
                     }
                 }
+
+                int pistonBlockId = worldManager.getBlockNetworkId(event.getBlock());
+                // event.getDirection() is unreliable
+                orientation = BlockState.of(pistonBlockId).getValue(Properties.FACING);
+
                 blocksFilled = true;
             }
 
-            int pistonBlockId = worldManager.getBlockNetworkId(event.getBlock());
-            // event.getDirection() is unreliable
-            Direction orientation = BlockState.of(pistonBlockId).getValue(Properties.FACING);
-
+            Direction pistonOrientation = orientation;
             session.executeInEventLoop(() -> {
                 PistonCache pistonCache = session.getPistonCache();
                 PistonBlockEntity blockEntity = pistonCache.getPistons().computeIfAbsent(position, pos ->
-                        new PistonBlockEntity(session, position, orientation, sticky, !isExtend));
+                        new PistonBlockEntity(session, position, pistonOrientation, sticky, !isExtend));
                 blockEntity.setAction(type, attachedBlocks);
             });
         }

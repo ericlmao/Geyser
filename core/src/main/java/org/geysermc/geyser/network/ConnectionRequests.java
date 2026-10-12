@@ -53,16 +53,22 @@ public final class ConnectionRequests {
      */
     public static boolean accept(GeyserImpl geyser, InetSocketAddress clientAddress,
                                  @Nullable InetSocketAddress proxyAddress) {
-        String ip = geyser.config().logPlayerIpAddresses() ? String.valueOf(clientAddress) : "<IP address withheld>";
-
         ConnectionRequestEvent requestEvent = new ConnectionRequestEvent(clientAddress, proxyAddress);
         geyser.eventBus().fire(requestEvent);
         if (requestEvent.isCancelled()) {
-            geyser.getLogger().debug("Connection request from " + ip + " was cancelled using the API!");
+            if (geyser.getLogger().isDebug()) {
+                geyser.getLogger().debug("Connection request from " + loggableAddress(geyser, clientAddress) + " was cancelled using the API!");
+            }
             return false;
         }
 
-        geyser.getLogger().debug(GeyserLocale.getLocaleStringLog("geyser.network.attempt_connect", ip));
+        if (geyser.getLogger().isDebug()) {
+            geyser.getLogger().debug(GeyserLocale.getLocaleStringLog("geyser.network.attempt_connect", loggableAddress(geyser, clientAddress)));
+        }
         return true;
+    }
+
+    private static String loggableAddress(GeyserImpl geyser, InetSocketAddress clientAddress) {
+        return geyser.config().logPlayerIpAddresses() ? String.valueOf(clientAddress) : "<IP address withheld>";
     }
 }

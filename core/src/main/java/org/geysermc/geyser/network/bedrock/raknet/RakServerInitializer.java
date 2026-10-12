@@ -43,6 +43,9 @@ public class RakServerInitializer extends GeyserServerInitializer {
         if (!rakCookiesEnabled) {
             channel.setOption(RakChannelOption.RAK_PROTOCOL_VERSION, 11);
         }
+        // RakNet's own limit on unsent data per client, checked by RakNet itself. The library default of 64 MiB lets a
+        // handful of clients on bad connections exhaust direct memory; the outbound limits are enforced before this.
+        channel.setOption(RakChannelOption.RAK_MAX_QUEUED_BYTES, this.geyser.getOutboundPolicy().limits().rakMaxQueuedBytes());
         super.preInitChannel(channel);
     }
 }

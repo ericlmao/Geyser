@@ -31,10 +31,10 @@ import com.google.gson.JsonSyntaxException;
 import java.net.ConnectException;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLException;
@@ -54,6 +54,11 @@ import org.java_websocket.handshake.ServerHandshake;
 
 public final class FloodgateSkinUploader {
     private static final int MAX_QUEUED_ENTRIES = 500;
+    /**
+     * Each entry embeds the full client data JWT (skin, geometry, animations), which is commonly 50-300 KB,
+     * so the entry count alone does not bound the queue's memory.
+     */
+    private static final long MAX_QUEUED_CHARS = 16L * 1024 * 1024;
 
     private final GeyserLogger logger;
     private final WebSocketClient client;
@@ -66,8 +71,9 @@ public final class FloodgateSkinUploader {
      * Some servers block access to external sites such as our global api, in which case the skin upload queue would
      * grow without the skins having a chance to be actually uploaded.
      * We'll lose player skins if the server started while the global api was offline, but that's worth the trade-off.
+     * Assigned on the websocket thread and read on session threads, hence volatile.
      */
-    private @MonotonicNonNull Deque<String> skinQueue = null;
+    private volatile @MonotonicNonNull BoundedSkinQueue skinQueue = null;
 
     @Getter private int id;
     @Getter private String verifyCode;
@@ -89,18 +95,21 @@ public final class FloodgateSkinUploader {
             public void onOpen(ServerHandshake handshake) {
                 setConnectionLostTimeout(11);
 
-                boolean hasSkinQueue = skinQueue != null;
+                BoundedSkinQueue queue = skinQueue;
 
-                if (!hasSkinQueue) {
-                    skinQueue = new LinkedList<>();
+                if (queue == null) {
+                    skinQueue = new BoundedSkinQueue(MAX_QUEUED_ENTRIES, MAX_QUEUED_CHARS);
                     return;
                 }
 
-                synchronized (skinQueue) {
-                    Iterator<String> queueIterator = skinQueue.iterator();
-                    while (isOpen() && queueIterator.hasNext()) {
-                        send(queueIterator.next());
-                        queueIterator.remove();
+                synchronized (queue) {
+                    QueuedSkin queued;
+                    while (isOpen() && (queued = queue.peekFirst()) != null) {
+                        // Skip players that left while the global api was unreachable, nobody would receive the result
+                        if (geyser.connectionByXuid(queued.xuid()) != null) {
+                            send(queued.json());
+                        }
+                        queue.removeFirst();
                     }
                 }
             }
@@ -265,14 +274,9 @@ public final class FloodgateSkinUploader {
             return;
         }
 
-        if (skinQueue != null) {
-            synchronized (skinQueue) {
-                // Only keep the most recent skins if we hit the limit, as it's more likely that they're still online
-                if (skinQueue.size() >= MAX_QUEUED_ENTRIES) {
-                    skinQueue.removeFirst();
-                }
-                skinQueue.addLast(jsonString);
-            }
+        BoundedSkinQueue queue = skinQueue;
+        if (queue != null) {
+            queue.add(new QueuedSkin(session.xuid(), jsonString));
         }
     }
 
@@ -284,9 +288,13 @@ public final class FloodgateSkinUploader {
             PluginMessageUtils.sendMessage(session, PluginMessageChannels.SKIN, bytes);
             return;
         }
-        geyser.getScheduledThread().schedule(
-                () -> sendSkinWhenSpawned(geyser, session, bytes, attempt + 1),
-                500, TimeUnit.MILLISECONDS);
+        try {
+            geyser.getScheduledThread().schedule(
+                    () -> sendSkinWhenSpawned(geyser, session, bytes, attempt + 1),
+                    500, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            // Geyser is shutting down or reloading; the session is being closed anyway
+        }
     }
 
     private void reconnectLater(GeyserImpl geyser) {
@@ -298,8 +306,12 @@ public final class FloodgateSkinUploader {
 
         long additionalTime = ThreadLocalRandom.current().nextInt(7);
         // we don't have to check the result. onClose will handle that for us
-        geyser.getScheduledThread()
-                .schedule(client::reconnect, 8 + additionalTime, TimeUnit.SECONDS);
+        geyser.getScheduledThread().schedule(() -> {
+            // The uploader may have been closed (e.g. by a reload) while this reconnect was pending
+            if (!closed) {
+                client.reconnect();
+            }
+        }, 8 + additionalTime, TimeUnit.SECONDS);
     }
 
     public FloodgateSkinUploader start() {
@@ -311,6 +323,70 @@ public final class FloodgateSkinUploader {
         if (!closed) {
             closed = true;
             client.close();
+            BoundedSkinQueue queue = skinQueue;
+            if (queue != null) {
+                queue.clear();
+            }
+        }
+    }
+
+    record QueuedSkin(String xuid, String json) {
+    }
+
+    /**
+     * Skin upload queue bounded by both entry count and total characters (roughly bytes, as the JSON is Latin-1).
+     * The oldest entries are evicted first, as the most recent skins are the most likely to still be online.
+     * All methods are synchronized on the queue itself, so callers may also hold its monitor to combine calls.
+     */
+    static final class BoundedSkinQueue {
+        private final int maxEntries;
+        private final long maxChars;
+        private final Deque<QueuedSkin> entries = new ArrayDeque<>();
+        private long queuedChars;
+
+        BoundedSkinQueue(int maxEntries, long maxChars) {
+            this.maxEntries = maxEntries;
+            this.maxChars = maxChars;
+        }
+
+        /**
+         * @return false if the entry is larger than the whole queue budget and was dropped
+         */
+        synchronized boolean add(QueuedSkin skin) {
+            int length = skin.json().length();
+            if (length > maxChars) {
+                return false;
+            }
+            while (!entries.isEmpty() && (entries.size() >= maxEntries || queuedChars + length > maxChars)) {
+                queuedChars -= entries.removeFirst().json().length();
+            }
+            entries.addLast(skin);
+            queuedChars += length;
+            return true;
+        }
+
+        synchronized QueuedSkin peekFirst() {
+            return entries.peekFirst();
+        }
+
+        synchronized void removeFirst() {
+            QueuedSkin removed = entries.pollFirst();
+            if (removed != null) {
+                queuedChars -= removed.json().length();
+            }
+        }
+
+        synchronized void clear() {
+            entries.clear();
+            queuedChars = 0;
+        }
+
+        synchronized int size() {
+            return entries.size();
+        }
+
+        synchronized long queuedChars() {
+            return queuedChars;
         }
     }
 }

@@ -35,10 +35,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.MessageFormat;
-import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 public class GeyserLocale {
     public static final String SYSTEM_LOCALE = "system";
@@ -46,13 +48,22 @@ public class GeyserLocale {
     /**
      * If we determine the default locale that the user wishes to use, use that locale
      */
-    private static String DEFAULT_LOCALE;
+    private static volatile String DEFAULT_LOCALE;
     /**
      * Whether the system locale cannot be loaded by Geyser.
      */
     private static boolean SYSTEM_LOCALE_INVALID;
 
-    private static final Map<String, Properties> LOCALE_MAPPINGS = new HashMap<>();
+    private static final Map<String, Properties> LOCALE_MAPPINGS = new ConcurrentHashMap<>();
+    /**
+     * Locales that could not be loaded. Client-supplied, so capped; past the cap misses are simply re-probed.
+     */
+    private static final Set<String> MISSING_LOCALES = ConcurrentHashMap.newKeySet();
+    private static final int MAX_MISSING_LOCALES = 256;
+    /**
+     * Locales end up in file and resource paths, and come from clients, so anything else is treated as unknown.
+     */
+    private static final Pattern VALID_LOCALE = Pattern.compile("[a-zA-Z]{2,3}(_[a-zA-Z0-9]{2,4})?");
 
     /**
      * Loads the initial locale(s) with the help of the bootstrap.
@@ -81,6 +92,8 @@ public class GeyserLocale {
      * Finalize the default locale, now that we know what the default locale should be.
      */
     public static void finalizeDefaultLocale(GeyserImpl geyser) {
+        // Re-probe on (re)start in case language files were added
+        MISSING_LOCALES.clear();
         String newDefaultLocale = geyser.config().defaultLocale();
         if (SYSTEM_LOCALE.equals(newDefaultLocale)) {
             // We want to use the system locale which is already loaded
@@ -114,9 +127,15 @@ public class GeyserLocale {
 
     private static @Nullable String loadGeyserLocale(String locale, GeyserBootstrap bootstrap) {
         locale = formatLocale(locale);
+        if (!isValidLocale(locale)) {
+            return null;
+        }
         // Don't load the locale if it's already loaded.
         if (LOCALE_MAPPINGS.containsKey(locale)) {
             return locale;
+        }
+        if (MISSING_LOCALES.contains(locale)) {
+            return null;
         }
 
         Properties localeProp = new Properties();
@@ -140,9 +159,6 @@ public class GeyserLocale {
                 } catch (Exception e) {
                     throw new AssertionError(getLocaleStringLog("geyser.language.load_failed", locale), e);
                 }
-
-                // Insert the locale into the mappings
-                LOCALE_MAPPINGS.put(locale, localeProp);
             } finally {
                 try {
                     localeStream.close();
@@ -165,10 +181,17 @@ public class GeyserLocale {
                 String message = "Unable to load custom language override!";
                 bootstrap.getGeyserLogger().error(message, e);
             }
-
-            LOCALE_MAPPINGS.putIfAbsent(locale, localeProp);
         }
-        return localeProp.isEmpty() ? null : locale;
+
+        if (localeProp.isEmpty()) {
+            if (MISSING_LOCALES.size() < MAX_MISSING_LOCALES) {
+                MISSING_LOCALES.add(locale);
+            }
+            return null;
+        }
+        // Publish only once fully loaded (jar strings plus overrides)
+        LOCALE_MAPPINGS.putIfAbsent(locale, localeProp);
+        return locale;
     }
 
     /**
@@ -245,6 +268,10 @@ public class GeyserLocale {
         }
 
         return MessageFormat.format(message.replace("'", "''"), values);
+    }
+
+    static boolean isValidLocale(@Nullable String locale) {
+        return locale != null && VALID_LOCALE.matcher(locale).matches();
     }
 
     /**

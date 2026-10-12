@@ -38,6 +38,7 @@ import org.geysermc.geyser.translator.text.MessageTranslator;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Handles Bedrock pings (either via raknet, or providing to the signaling server for nethernet).
@@ -55,6 +56,10 @@ public final class BedrockPingHandler {
      * The MOTD, sub-MOTD and Minecraft version ({@link #PING_VERSION_BYTES_LENGTH}) combined cannot reach this length.
      */
     private static final int MAGIC_RAKNET_LENGTH = 338;
+    /**
+     * How long a passthrough result is reused, so every unauthenticated ping does not run the platform ping event.
+     */
+    private static final long PING_CACHE_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     private final GeyserImpl geyser;
 
@@ -62,6 +67,11 @@ public final class BedrockPingHandler {
      * The port to broadcast in the pong. This can be different from the port the server is bound to, e.g. due to port forwarding.
      */
     private final int broadcastPort;
+
+    /**
+     * The last passthrough result and its parsed MOTD lines; replaced as a whole so readers see a consistent pair.
+     */
+    private volatile CachedPing cachedPing;
 
     public BedrockPingHandler(GeyserImpl geyser) {
         this.geyser = geyser;
@@ -83,11 +93,26 @@ public final class BedrockPingHandler {
         GeyserConfig config = geyser.config();
 
         GeyserPingInfo pingInfo = null;
+        String[] motd = null;
         if (config.motd().passthroughMotd() || config.motd().passthroughPlayerCounts()) {
-            IGeyserPingPassthrough pingPassthrough = geyser.getBootstrap().getGeyserPingPassthrough();
-            if (pingPassthrough != null) {
-                pingInfo = pingPassthrough.getPingInformation(inetSocketAddress);
+            CachedPing cached = this.cachedPing;
+            long now = System.nanoTime();
+            if (cached == null || now - cached.fetchedAtNanos() >= PING_CACHE_NANOS) {
+                // A concurrent query may fetch as well; harmless
+                GeyserPingInfo fetched = null;
+                IGeyserPingPassthrough pingPassthrough = geyser.getBootstrap().getGeyserPingPassthrough();
+                if (pingPassthrough != null) {
+                    fetched = pingPassthrough.getPingInformation(inetSocketAddress);
+                }
+                String[] fetchedMotd = null;
+                if (fetched != null && fetched.getDescription() != null) {
+                    fetchedMotd = MessageTranslator.convertToPlainTextLenient(fetched.getDescription(), GeyserLocale.getDefaultLocale()).split("\n");
+                }
+                cached = new CachedPing(fetched, fetchedMotd, now);
+                this.cachedPing = cached;
             }
+            pingInfo = cached.pingInfo();
+            motd = cached.motd();
         }
 
         BedrockPong pong = new BedrockPong()
@@ -100,8 +125,7 @@ public final class BedrockPingHandler {
                 .ipv6Port(this.broadcastPort)
                 .serverId(serverId);
 
-        if (config.motd().passthroughMotd() && pingInfo != null && pingInfo.getDescription() != null) {
-            String[] motd = MessageTranslator.convertToPlainTextLenient(pingInfo.getDescription(), GeyserLocale.getDefaultLocale()).split("\n");
+        if (config.motd().passthroughMotd() && motd != null) {
             String mainMotd = (motd.length > 0) ? motd[0] : config.motd().primaryMotd(); // First line of the motd.
             String subMotd = (motd.length > 1) ? motd[1] : config.motd().secondaryMotd(); // Second line of the motd if present, otherwise default.
 
@@ -113,7 +137,7 @@ public final class BedrockPingHandler {
         }
 
         // Placed here to prevent overriding values set in the ping event.
-        if (config.motd().passthroughPlayerCounts() && pingInfo != null) {
+        if (config.motd().passthroughPlayerCounts() && pingInfo != null && pingInfo.getPlayers() != null) {
             pong.playerCount(pingInfo.getPlayers().getOnline());
             pong.maximumPlayerCount(pingInfo.getPlayers().getMax());
         } else {
@@ -167,5 +191,8 @@ public final class BedrockPingHandler {
         }
 
         return pong;
+    }
+
+    private record CachedPing(GeyserPingInfo pingInfo, String[] motd, long fetchedAtNanos) {
     }
 }

@@ -27,6 +27,7 @@ package org.geysermc.geyser.pack.url;
 
 import java.io.IOException;
 import java.nio.channels.SeekableByteChannel;
+import java.nio.file.Path;
 import java.util.Objects;
 import lombok.Getter;
 import org.checkerframework.checker.nullness.qual.NonNull;
@@ -38,6 +39,7 @@ import org.geysermc.geyser.pack.ResourcePackHolder;
 import org.geysermc.geyser.registry.Registries;
 import org.geysermc.geyser.registry.loader.ResourcePackLoader;
 import org.geysermc.geyser.text.GeyserLocale;
+import org.geysermc.geyser.util.WebUtils;
 
 public class GeyserUrlPackCodec extends UrlPackCodec {
     private final @NonNull String url;
@@ -105,18 +107,28 @@ public class GeyserUrlPackCodec extends UrlPackCodec {
     public void testForChanges(ResourcePackHolder holder) {
         ResourcePackLoader.downloadPack(url, true)
             .thenAccept(backingPathCodec -> {
-                GeyserResourcePack updatedPack = ResourcePackLoader.readPack(backingPathCodec.path())
-                    .contentKey(holder.pack().contentKey())
-                    .build();
+                // The forced download is only a candidate: it does not replace the cached copy until it is adopted below
+                Path candidate = backingPathCodec.path();
+                GeyserResourcePack updatedPack;
+                try {
+                    updatedPack = ResourcePackLoader.readPack(candidate)
+                        .contentKey(holder.pack().contentKey())
+                        .build();
+                } catch (RuntimeException e) {
+                    WebUtils.discardRemotePack(url, candidate);
+                    throw e;
+                }
                 if (updatedPack.uuid().equals(holder.uuid())) {
                     var currentVersion = holder.version().toString();
                     var updatedVersion = updatedPack.manifest().header().version().toString();
                     if (currentVersion.equals(updatedVersion)) {
                         GeyserImpl.getInstance().getLogger().info("No version or pack change detected: Was the resource pack server down?");
+                        // We keep serving the current fallback; don't keep a second copy of the same pack on disk
+                        WebUtils.discardRemotePack(url, candidate);
                         return;
                     } else {
                         GeyserImpl.getInstance().getLogger().info("Detected a new resource pack version (%s, old version %s) for pack at %s!"
-                            .formatted(currentVersion, updatedVersion, url));
+                            .formatted(updatedVersion, currentVersion, url));
                     }
                 } else {
                     GeyserImpl.getInstance().getLogger().info("Detected a new resource pack at the url %s!".formatted(url));
@@ -128,11 +140,18 @@ public class GeyserUrlPackCodec extends UrlPackCodec {
                 // Keep the pack options that were previously set
                 Registries.RESOURCE_PACKS.get().put(updatedPack.uuid(), holder.withPack(pack));
 
+                // Make the new download the cached copy. The previous fallback file may still be in use by clients
+                // that are mid-download; it is removed by the remote pack cache cleanup on the next (re)load.
+                WebUtils.promoteRemotePack(url, candidate);
             })
             .whenComplete((result, throwable) -> {
                 if (throwable != null) {
                     GeyserImpl.getInstance().getLogger().error(GeyserLocale.getLocaleStringLog("geyser.resource_pack.broken", url), throwable);
-                    Registries.RESOURCE_PACKS.get().remove(holder.uuid());
+                    // A failed check (e.g. the pack host is down) does not invalidate the cached copy we are serving,
+                    // so only drop the pack if there is nothing to fall back to.
+                    if (this.fallback == null) {
+                        Registries.RESOURCE_PACKS.get().remove(holder.uuid());
+                    }
                 }
             });
     }

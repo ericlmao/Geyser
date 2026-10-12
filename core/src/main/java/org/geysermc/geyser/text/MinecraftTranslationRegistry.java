@@ -31,6 +31,8 @@ import org.checkerframework.checker.nullness.qual.Nullable;
 
 import java.text.MessageFormat;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -43,6 +45,15 @@ public class MinecraftTranslationRegistry extends TranslatableComponentRenderer<
     private final Pattern positionalStringReplacement = Pattern.compile("%([0-9]+)\\$s");
     private final Pattern escapeBraces = Pattern.compile("\\{+['{]+\\{+|\\{+");
 
+    /**
+     * Converted MessageFormat patterns per lower case locale. Each entry belongs to the locale map it was built
+     * from, so a reloaded locale never serves patterns of the map it replaced.
+     */
+    private final Map<String, PatternCache> patternCache = new ConcurrentHashMap<>();
+
+    private record PatternCache(Map<String, String> source, Map<String, String> patterns) {
+    }
+
     // Exists to maintain compatibility with Velocity's older Adventure version
     @Override
     public @Nullable MessageFormat translate(@NonNull String key, @NonNull String locale) {
@@ -51,12 +62,17 @@ public class MinecraftTranslationRegistry extends TranslatableComponentRenderer<
 
     @Override
     protected @Nullable MessageFormat translate(@NonNull String key, @Nullable String fallback, @NonNull String locale) {
+        String lowercaseLocale = locale.toLowerCase(Locale.ROOT);
+        // Read before the string, so the cache entry can't be tied to a newer map than the string came from
+        Map<String, String> source = MinecraftLocale.LOCALE_MAPPINGS.get(lowercaseLocale);
+
         // Get the locale string
-        String localeString = MinecraftLocale.getLocaleStringIfPresent(key, locale);
+        String localeString = MinecraftLocale.getLocaleStringIfPresent(key, lowercaseLocale);
         if (localeString == null) {
             if (fallback != null) {
                 // Fallback strings will still have their params inserted
-                localeString = fallback;
+                // They come from the component, so they aren't cached
+                return new MessageFormat(convert(fallback), Locale.ROOT);
             } else {
                 // The original translation will be translated
                 // Can be tested with 1.19.4: {"translate":"%s","with":[{"text":"weeeeeee"}]}
@@ -64,6 +80,44 @@ public class MinecraftTranslationRegistry extends TranslatableComponentRenderer<
             }
         }
 
+        // MessageFormat isn't thread-safe and this renderer is shared, so only the converted pattern is cached
+        if (source == null) {
+            // Locale not loaded (yet): this is the en_us string, which must not be cached under this locale
+            return new MessageFormat(convert(localeString), Locale.ROOT);
+        }
+        PatternCache cache = patternCache.get(lowercaseLocale);
+        if (cache == null || cache.source() != source) {
+            cache = new PatternCache(source, new ConcurrentHashMap<>());
+            patternCache.put(lowercaseLocale, cache);
+        }
+        String pattern = cache.patterns().get(key);
+        if (pattern == null) {
+            pattern = convert(localeString);
+            cache.patterns().put(key, pattern);
+        }
+        return new MessageFormat(pattern, Locale.ROOT);
+    }
+
+    /**
+     * Drops the cached patterns of a locale, e.g. when it is unloaded.
+     *
+     * @param locale the locale
+     */
+    public void invalidate(String locale) {
+        patternCache.remove(locale.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Drops cached patterns of locales that are no longer loaded, or were loaded again since.
+     */
+    public void prune() {
+        patternCache.entrySet().removeIf(entry -> MinecraftLocale.LOCALE_MAPPINGS.get(entry.getKey()) != entry.getValue().source());
+    }
+
+    /**
+     * Converts a Java translation string into a MessageFormat pattern.
+     */
+    private String convert(String localeString) {
         // replace single quote instances which get lost in MessageFormat otherwise
         localeString = localeString.replace("'", "''");
 
@@ -97,6 +151,14 @@ public class MinecraftTranslationRegistry extends TranslatableComponentRenderer<
         m.appendTail(sb);
 
         // Locale shouldn't need to be specific - dates for example will not be handled
-        return new MessageFormat(sb.toString(), Locale.ROOT);
+        return sb.toString();
+    }
+
+    /**
+     * @return the number of cached patterns for a locale, for tests
+     */
+    int cachedPatterns(String locale) {
+        PatternCache cache = patternCache.get(locale.toLowerCase(Locale.ROOT));
+        return cache == null ? 0 : cache.patterns().size();
     }
 }

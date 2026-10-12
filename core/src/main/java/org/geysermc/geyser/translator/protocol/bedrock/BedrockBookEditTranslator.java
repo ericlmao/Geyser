@@ -74,6 +74,9 @@ public class BedrockBookEditTranslator extends PacketTranslator<BookEditPacket> 
             }
             switch (packet.getAction()) {
                 case ADD_PAGE: {
+                    if (packet.getText() == null) {
+                        return;
+                    }
                     // Add empty pages in between
                     for (int i = pages.size(); i < page; i++) {
                         pages.add(i, "");
@@ -83,6 +86,9 @@ public class BedrockBookEditTranslator extends PacketTranslator<BookEditPacket> 
                 }
                 // Called whenever a page is modified
                 case REPLACE_PAGE: {
+                    if (packet.getText() == null) {
+                        return;
+                    }
                     if (page < pages.size()) {
                         pages.set(page, MessageTranslator.convertIncomingToPlainText(packet.getText()));
                     } else {
@@ -137,7 +143,11 @@ public class BedrockBookEditTranslator extends PacketTranslator<BookEditPacket> 
             String title;
             if (packet.getAction() == BookEditPacket.Action.SIGN_BOOK) {
                 // Add title to packet so the server knows we're signing
-                title = MessageTranslator.convertIncomingToPlainText(packet.getTitle());
+                String rawTitle = packet.getTitle();
+                if (rawTitle == null) {
+                    return;
+                }
+                title = MessageTranslator.convertIncomingToPlainText(rawTitle);
                 if (title.length() > WrittenBookItem.MAXIMUM_TITLE_LENGTH) {
                     session.getGeyser().getLogger().warning("Book title larger than server allows!");
                     return;

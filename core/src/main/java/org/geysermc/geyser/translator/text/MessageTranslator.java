@@ -40,7 +40,6 @@ import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.Style;
 import net.kyori.adventure.text.format.TextColor;
 import net.kyori.adventure.text.format.TextDecoration;
-import net.kyori.adventure.text.renderer.TranslatableComponentRenderer;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
 import net.kyori.adventure.text.serializer.legacy.CharacterAndFormat;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
@@ -64,7 +63,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.chat.ChatTypeDecoration;
 public class MessageTranslator {
     // These are used for handling the translations of the messages
     // Custom instead of TranslatableComponentRenderer#usingTranslationSource so we don't need to worry about finding a Locale class
-    private static final TranslatableComponentRenderer<String> RENDERER = new MinecraftTranslationRegistry();
+    private static final MinecraftTranslationRegistry RENDERER = new MinecraftTranslationRegistry();
 
     // Possible TODO: replace the legacy hover event serializer with an empty one since we have no use for hover events
     private static final GsonComponentSerializer GSON_SERIALIZER;
@@ -670,6 +669,22 @@ public class MessageTranslator {
             return false;
         }
         return builder.indexOf(suffix, builder.length() - suffix.length()) != -1;
+    }
+
+    /**
+     * Drops the cached translation patterns of a locale; call when the locale is unloaded or replaced.
+     *
+     * @param locale the locale
+     */
+    public static void invalidateTranslations(String locale) {
+        RENDERER.invalidate(locale);
+    }
+
+    /**
+     * Drops cached translation patterns of locales that are no longer loaded.
+     */
+    public static void pruneTranslations() {
+        RENDERER.prune();
     }
 
     public static void init() {

@@ -25,6 +25,7 @@
 
 package org.geysermc.geyser;
 
+import org.cloudburstmc.netty.channel.raknet.RakOutboundBudget;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.netty.channel.epoll.Epoll;
@@ -85,7 +86,11 @@ import org.geysermc.geyser.level.BedrockDimension;
 import org.geysermc.geyser.level.WorldManager;
 import org.geysermc.geyser.network.RaknetServer;
 import org.geysermc.geyser.network.bedrock.GameProtocol;
+import org.geysermc.geyser.network.bedrock.GeyserOutboundPolicy;
+import org.geysermc.geyser.network.bedrock.OutboundLimits;
+import org.geysermc.geyser.network.bedrock.TransportMonitor;
 import org.geysermc.geyser.network.bedrock.nethernet.NetherNetServer;
+import org.geysermc.geyser.network.java.LocalSession;
 import org.geysermc.geyser.ping.GeyserLegacyPingPassthrough;
 import org.geysermc.geyser.registry.BlockRegistries;
 import org.geysermc.geyser.registry.Registries;
@@ -133,8 +138,12 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -173,10 +182,23 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
 
     private ScheduledExecutorService scheduledThread;
 
+    /**
+     * Runs blocking work such as HTTP requests and Microsoft authentication, so it never sits on the common pool or an
+     * event loop. Nothing in core should call {@code CompletableFuture.runAsync/supplyAsync} without an executor unless
+     * the task is pure CPU work. Shut down in {@link #disable()} and recreated by {@link #startInstance()}.
+     */
+    @Getter(AccessLevel.NONE)
+    private volatile ExecutorService blockingExecutor;
+
     private ScoreboardUpdater scoreboardUpdater;
 
     private RaknetServer geyserServer;
     private NetherNetServer netherNetServer;
+    /**
+     * Limits on outbound work for Bedrock connections, and the monitor enforcing them; recreated on each start.
+     */
+    private GeyserOutboundPolicy outboundPolicy;
+    private TransportMonitor transportMonitor;
     private final GeyserBootstrap bootstrap;
 
     private final GeyserEventBus eventBus;
@@ -203,6 +225,11 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
     @Setter
     private boolean isEnabled;
 
+    /**
+     * Set once the one-time work in {@link #initialize()} is done; later enables only run {@link #startInstance()}.
+     */
+    private boolean initialized;
+
     private GeyserImpl(GeyserBootstrap bootstrap) {
         instance = this;
 
@@ -224,7 +251,9 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         this.eventBus.fire(new GeyserPreInitializeEvent(this.extensionManager, this.eventBus));
     }
 
-    public void initialize() {
+    public boolean initialize() {
+        ensureBlockingExecutor();
+
         // Setup encryption early so we don't start if we can't auth
         if (config().advanced().bedrock().validateBedrockLogin()) {
             try {
@@ -232,7 +261,7 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
             } catch (Throwable t) {
                 GeyserImpl.getInstance().getLogger().error("Unable to set up encryption! This can be caused by your internet connection or the Minecraft api being unreachable. ", t);
                 this.disable();
-                return;
+                return false;
             }
         }
 
@@ -269,7 +298,7 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         MessageTranslator.init();
 
         // Download the latest asset list and cache it
-        AssetUtils.generateAssetCache().whenComplete((aVoid, ex) -> {
+        AssetUtils.generateAssetCache().whenCompleteAsync((aVoid, ex) -> {
             if (ex != null) {
                 return;
             }
@@ -279,14 +308,16 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
 
             ProvidedSkins.init();
 
-            CompletableFuture.runAsync(AssetUtils::downloadAndRunClientJarTasks);
-        });
+            CompletableFuture.runAsync(AssetUtils::downloadAndRunClientJarTasks, blockingExecutor);
+        }, blockingExecutor);
 
         // Register our general permissions when possible
         eventBus.subscribe(this, GeyserRegisterPermissionsEvent.class, Permissions::register);
         // Replace disconnect messages whenever necessary
         eventBus.subscribe(this, SessionDisconnectEventImpl.class, SessionDisconnectListener::onSessionDisconnect);
 
+        // Registries and subscribers are in place; a failed start below must not make the next enable redo them
+        initialized = true;
         startInstance();
 
         GeyserConfig config = bootstrap.config();
@@ -306,22 +337,50 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         }
 
         VersionCheckUtils.checkForOutdatedJava(logger);
+        return true;
     }
 
     private void startInstance() {
-        this.scheduledThread = Executors.newSingleThreadScheduledExecutor(new DefaultThreadFactory("Geyser Scheduled Thread"));
+        ensureBlockingExecutor();
+        try {
+            startInstance0();
+        } catch (Throwable t) {
+            // e.g. a failed bind: without this the servers, their event loops and the monitor would outlive the failed start
+            try {
+                disable();
+            } catch (Throwable suppressed) {
+                t.addSuppressed(suppressed);
+            }
+            throw t;
+        }
+    }
+
+    private void startInstance0() {
+        ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, new DefaultThreadFactory("Geyser Scheduled Thread"));
+        // On disable, tasks already due (e.g. a queued auth chain write) still run; delayed one-shots are dropped
+        scheduler.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+        scheduler.setRemoveOnCancelPolicy(true);
+        this.scheduledThread = scheduler;
+        // Unload Java locales no player has used for a while (en_us and the default locale are kept)
+        scheduler.scheduleAtFixedRate(MinecraftLocale::evictIdleLocales, 10, 10, TimeUnit.MINUTES);
 
         if (isReloading) {
             // If we're reloading, the default locale in the config might have changed.
             GeyserLocale.finalizeDefaultLocale(this);
-        } else {
-            CodeOfConductManager.load();
         }
+        // Loads the cache once; reschedules the periodic save on the new scheduledThread every start
+        CodeOfConductManager.load();
 
         GeyserLogger logger = bootstrap.getGeyserLogger();
         GeyserConfig config = bootstrap.config();
 
         this.scoreboardUpdater = ScoreboardUpdater.init();
+
+        OutboundLimits outboundLimits = OutboundLimits.fromSystemProperties(logger);
+        RakOutboundBudget.configure(outboundLimits.rakMaxOutstandingBytes(), outboundLimits.rakMaxTotalOutstandingBytes(), outboundLimits.rakMaxPendingWrites());
+        this.outboundPolicy = new GeyserOutboundPolicy(outboundLimits, logger);
+        this.transportMonitor = new TransportMonitor(logger, outboundLimits, this.outboundPolicy);
+        this.transportMonitor.start();
 
         SkinProvider.registerCacheImageTask(this);
 
@@ -682,6 +741,9 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         runIfNonNull(scoreboardUpdater, ScoreboardUpdater::shutdown);
         runIfNonNull(netherNetServer, NetherNetServer::shutdown);
         runIfNonNull(geyserServer, RaknetServer::shutdown);
+        runIfNonNull(transportMonitor, TransportMonitor::shutdown);
+        // Sessions are gone, so this only interrupts startup downloads and in-flight Microsoft logins
+        runIfNonNull(blockingExecutor, ExecutorService::shutdownNow);
         SkinProvider.shutdown();
         runIfNonNull(skinUploader, FloodgateSkinUploader::close);
         runIfNonNull(newsHandler, NewsHandler::shutdown);
@@ -705,6 +767,8 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         if (isEnabled) {
             this.disable();
         }
+        LocalSession.shutdownEventLoopGroup();
+        MinecraftLocale.shutdown();
 
         // Disable extensions, fire the shutdown event
         this.eventBus.fire(new GeyserShutdownEvent(this.extensionManager, this.eventBus));
@@ -831,10 +895,10 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
             throw new RuntimeException("Geyser has not been loaded yet!");
         }
 
-        if (getInstance().isReloading()) {
+        if (instance.initialized) {
             instance.startInstance();
-        } else {
-            instance.initialize();
+        } else if (!instance.initialize()) {
+            return;
         }
         instance.setEnabled(true);
     }
@@ -867,6 +931,36 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         if (!Objects.equals(authChain, savedAuthChains.put(bedrockName, authChain))) {
             scheduleAuthChainsWrite();
         }
+    }
+
+    /**
+     * @return the executor for blocking work; see {@link #blockingExecutor}
+     */
+    public ExecutorService blockingExecutor() {
+        ExecutorService executor = blockingExecutor;
+        if (executor == null) {
+            ensureBlockingExecutor();
+            executor = blockingExecutor;
+        }
+        return executor;
+    }
+
+    private synchronized void ensureBlockingExecutor() {
+        if (blockingExecutor == null || blockingExecutor.isShutdown()) {
+            blockingExecutor = newBlockingExecutor();
+        }
+    }
+
+    /**
+     * Each Microsoft login can hold a thread for the whole pending authentication timeout, so the size does not follow
+     * the core count. The queue is unbounded on purpose so that authentication is never rejected; with an unbounded
+     * queue the pool never grows past its core size, so core and maximum are equal and idle threads time out instead.
+     */
+    public static ExecutorService newBlockingExecutor() {
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(16, 16, 60, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(), new DefaultThreadFactory("Geyser Blocking IO", true));
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
     }
 
     private <T> void runIfNonNull(T nullable, Consumer<@NonNull T> consumer) {

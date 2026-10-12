@@ -34,6 +34,7 @@ import org.geysermc.geyser.session.GeyserSession;
 import org.geysermc.geyser.translator.level.block.entity.BlockEntityTranslator;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
 
+import java.util.EnumMap;
 import java.util.Locale;
 import java.util.Map;
 
@@ -51,7 +52,22 @@ public class BlockEntityUtils {
             // There are some legacy IDs sent but as far as I can tell they are not needed for things to work properly
     );
 
+    /**
+     * Bedrock block entity ids for every Java block entity type, computed once. Immutable after static init.
+     */
+    private static final Map<BlockEntityType, String> BEDROCK_BLOCK_ENTITY_IDS = new EnumMap<>(BlockEntityType.class);
+
+    static {
+        for (BlockEntityType type : BlockEntityType.values()) {
+            BEDROCK_BLOCK_ENTITY_IDS.put(type, computeBedrockBlockEntityId(type));
+        }
+    }
+
     public static String getBedrockBlockEntityId(BlockEntityType type) {
+        return BEDROCK_BLOCK_ENTITY_IDS.get(type);
+    }
+
+    private static String computeBedrockBlockEntityId(BlockEntityType type) {
         // These are the only exceptions when it comes to block entity ids
         String value = BLOCK_ENTITY_TRANSLATIONS.get(type);
         if (value != null) {

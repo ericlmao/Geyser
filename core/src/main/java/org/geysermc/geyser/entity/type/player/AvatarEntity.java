@@ -205,7 +205,12 @@ public abstract class AvatarEntity extends LivingEntity {
     }
 
     public void setSkin(ResolvableProfile profile) {
-        SkinManager.resolveProfile(profile).thenAccept(resolved -> setSkin(resolved, null));
+        SkinManager.resolveProfile(profile).thenAccept(resolved -> session.ensureInEventLoop(() -> {
+            // textures is owned by the event loop
+            if (!session.isClosed() && isValid()) {
+                setSkin(resolved, null);
+            }
+        }));
     }
 
     public void setSkin(GameProfile profile, @Nullable Runnable after) {

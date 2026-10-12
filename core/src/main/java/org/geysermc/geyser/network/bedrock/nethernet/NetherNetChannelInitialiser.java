@@ -96,6 +96,6 @@ public class NetherNetChannelInitialiser extends GeyserServerInitializer {
 
     @Override
     protected BedrockPeer createPeer(Channel channel) {
-        return new NetherNetPeer(channel, this::createSession);
+        return new NetherNetPeer(channel, this::createSession, this.geyser.getOutboundPolicy(), this.geyser.getTransportMonitor());
     }
 }

@@ -269,8 +269,23 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
             case SEND_PACKS -> {
                 // Bedrock clients can send empty "send_packs" responses, in which case we shouldn't send anything back
                 if (!packet.getPackIds().isEmpty()) {
-                    packsToSend.addAll(packet.getPackIds());
-                    sendPackDataInfo(packsToSend.pop());
+                    // Pack ids are client-controlled; only the popped id is validated by sendPackDataInfo.
+                    // Dedupe and cap the queue so repeated SEND_PACKS responses cannot grow it without bound.
+                    int maxQueued = Math.max(1, this.resourcePackLoadEvent.getPacks().size() * 2);
+                    for (String id : packet.getPackIds()) {
+                        if (packsToSend.contains(id)) {
+                            continue;
+                        }
+                        if (packsToSend.size() >= maxQueued) {
+                            GeyserImpl.getInstance().getLogger().debug("Client %s requested too many resource packs!", session.bedrockUsername());
+                            session.disconnect("disconnectionScreen.resourcePack");
+                            return PacketSignal.HANDLED;
+                        }
+                        packsToSend.add(id);
+                    }
+                    if (!packsToSend.isEmpty()) {
+                        sendPackDataInfo(packsToSend.pop());
+                    }
                     return PacketSignal.HANDLED;
                 }
             }
@@ -369,8 +384,9 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
 
         int index = packet.getChunkIndex();
         long offset = (long) index * GeyserResourcePack.CHUNK_SIZE;
+        long packSize = codec.size();
         BitSet sent = sentChunks.computeIfAbsent(packet.getPackId(), id -> new BitSet());
-        if (index < 0 || offset >= codec.size() || sent.get(index)) {
+        if (index < 0 || offset >= packSize || sent.get(index)) {
             return;
         }
         sent.set(index);
@@ -381,15 +397,29 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
         data.setPackVersion(packet.getPackVersion());
         data.setPackId(packet.getPackId());
 
-        long remainingSize = codec.size() - offset;
+        long remainingSize = packSize - offset;
         byte[] packData = new byte[(int) MathUtils.constrain(remainingSize, 0, GeyserResourcePack.CHUNK_SIZE)];
 
         try (SeekableByteChannel channel = codec.serialize()) {
             channel.position(offset);
-            channel.read(ByteBuffer.wrap(packData, 0, packData.length));
+            ByteBuffer buffer = ByteBuffer.wrap(packData, 0, packData.length);
+            // A single read may return fewer bytes than requested (e.g. on network filesystems)
+            while (buffer.hasRemaining()) {
+                if (channel.read(buffer) == -1) {
+                    break;
+                }
+            }
+            if (buffer.hasRemaining()) {
+                // The pack file is shorter than its advertised size; never send zero-filled data
+                GeyserImpl.getInstance().getLogger().error("Resource pack %s is shorter than expected (read %d of %d bytes at offset %d)!"
+                    .formatted(holder.uuid(), buffer.position(), packData.length, offset));
+                session.disconnect("disconnectionScreen.resourcePack");
+                return;
+            }
         } catch (IOException e) {
             session.disconnect("disconnectionScreen.resourcePack");
             e.printStackTrace();
+            return;
         }
 
         data.setData(Unpooled.wrappedBuffer(packData));
@@ -437,9 +467,10 @@ public class UpstreamPacketHandler extends LoggingPacketHandler {
         ResourcePackManifest.Header header = pack.manifest().header();
 
         data.setPackId(header.uuid());
-        int chunkCount = (int) Math.ceil(codec.size() / (double) GeyserResourcePack.CHUNK_SIZE);
+        long packSize = codec.size();
+        int chunkCount = (int) Math.ceil(packSize / (double) GeyserResourcePack.CHUNK_SIZE);
         data.setChunkCount(chunkCount);
-        data.setCompressedPackSize(codec.size());
+        data.setCompressedPackSize(packSize);
         data.setMaxChunkSize(GeyserResourcePack.CHUNK_SIZE);
         data.setHash(codec.sha256());
         data.setPackVersion(packID[1]);

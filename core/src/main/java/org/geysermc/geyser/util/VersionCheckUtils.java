@@ -32,6 +32,7 @@ import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import org.checkerframework.checker.nullness.qual.NonNull;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.geysermc.geyser.Constants;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.GeyserLogger;
@@ -42,13 +43,20 @@ import org.geysermc.geyser.text.GeyserLocale;
 import java.net.UnknownHostException;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public final class VersionCheckUtils {
     @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-    private static @NonNull OptionalInt LATEST_BEDROCK_RELEASE = OptionalInt.empty();
+    private static volatile @NonNull OptionalInt LATEST_BEDROCK_RELEASE = OptionalInt.empty();
+    /**
+     * Plugin platforms check on every join of a player allowed to see updates, so the answer is reused for a while.
+     */
+    private static final long CHECK_TTL_MILLIS = TimeUnit.HOURS.toMillis(6);
+    private static volatile long lastCheckMillis;
+    private static volatile @Nullable String latestBedrockVersionName;
     private static final int SUPPORTED_JAVA_VERSION = 21;
 
     public static void checkForOutdatedFloodgate(GeyserLogger logger) {
@@ -93,17 +101,29 @@ public final class VersionCheckUtils {
     public static void checkForGeyserUpdate(Supplier<GeyserCommandSource> recipient) {
         CompletableFuture.runAsync(() -> {
             try {
-                JsonObject json = WebUtils.getJson("https://api.geysermc.org/v2/versions/geyser");
-                JsonObject bedrock = json.getAsJsonObject("bedrock").getAsJsonObject("protocol");
-                int protocolVersion = bedrock.get("id").getAsInt();
-                if (GameProtocol.getBedrockCodec(protocolVersion) != null) {
-                    LATEST_BEDROCK_RELEASE = OptionalInt.empty();
-                    // We support the latest version! No need to print a message.
-                    return;
-                }
+                final String newBedrockVersion;
+                if (System.currentTimeMillis() - lastCheckMillis < CHECK_TTL_MILLIS) {
+                    newBedrockVersion = latestBedrockVersionName;
+                    if (newBedrockVersion == null) {
+                        return;
+                    }
+                } else {
+                    JsonObject json = WebUtils.getJson("https://api.geysermc.org/v2/versions/geyser");
+                    JsonObject bedrock = json.getAsJsonObject("bedrock").getAsJsonObject("protocol");
+                    int protocolVersion = bedrock.get("id").getAsInt();
+                    if (GameProtocol.getBedrockCodec(protocolVersion) != null) {
+                        LATEST_BEDROCK_RELEASE = OptionalInt.empty();
+                        latestBedrockVersionName = null;
+                        lastCheckMillis = System.currentTimeMillis();
+                        // We support the latest version! No need to print a message.
+                        return;
+                    }
 
-                LATEST_BEDROCK_RELEASE = OptionalInt.of(protocolVersion);
-                final String newBedrockVersion = bedrock.get("name").getAsString();
+                    LATEST_BEDROCK_RELEASE = OptionalInt.of(protocolVersion);
+                    newBedrockVersion = bedrock.get("name").getAsString();
+                    latestBedrockVersionName = newBedrockVersion;
+                    lastCheckMillis = System.currentTimeMillis();
+                }
 
                 // Delayed for two reasons: save unnecessary processing, and wait to load locale if this is on join.
                 GeyserCommandSource sender = recipient.get();
@@ -126,7 +146,7 @@ public final class VersionCheckUtils {
             } catch (Exception e) {
                 GeyserImpl.getInstance().getLogger().error("Error whilst checking for Geyser update!", e);
             }
-        });
+        }, GeyserImpl.getInstance().blockingExecutor());
     }
 
     public static @NonNull OptionalInt getLatestBedrockRelease() {

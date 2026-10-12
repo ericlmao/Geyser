@@ -48,9 +48,10 @@ public class JavaUpdateAdvancementsTranslator extends PacketTranslator<Clientbou
             advancementsCache.getStoredAdvancementProgress().clear();
         }
 
-        // Removes removed advancements from player's stored advancements
+        // Removes removed advancements from player's stored advancements and their progress
         for (String removedAdvancement : packet.getRemovedAdvancements()) {
             advancementsCache.getStoredAdvancements().remove(removedAdvancement);
+            advancementsCache.getStoredAdvancementProgress().remove(removedAdvancement);
         }
 
         advancementsCache.getStoredAdvancementProgress().putAll(packet.getProgress());

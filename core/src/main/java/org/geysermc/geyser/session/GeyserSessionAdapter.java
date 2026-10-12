@@ -25,6 +25,8 @@
 
 package org.geysermc.geyser.session;
 
+import io.netty.channel.Channel;
+import net.kyori.adventure.text.Component;
 import org.geysermc.floodgate.crypto.FloodgateCipher;
 import org.geysermc.floodgate.util.BedrockData;
 import org.geysermc.geyser.Constants;
@@ -124,6 +126,21 @@ public class GeyserSessionAdapter extends SessionAdapter {
 
     @Override
     public void connected(ConnectedEvent event) {
+        if (session.isClosed()) {
+            // The Bedrock player left while the connection to the Java server was being made. GeyserSession#disconnect
+            // can't close a connection whose channel doesn't exist yet, so close it now that it does, before the
+            // Java server keeps it as a player that is still online.
+            geyser.getLogger().debug("Closing the Java connection of " + session.bedrockUsername() + ", who left while it was being made");
+            Session downstream = event.getSession();
+            downstream.disconnect(Component.text("Bedrock client disconnected"));
+            // If the connection was told to disconnect before its channel existed, disconnect() does nothing now
+            Channel channel = downstream.getChannel();
+            if (channel != null && channel.isOpen()) {
+                channel.close();
+            }
+            return;
+        }
+
         session.loggingIn = false;
         session.loggedIn = true;
 
@@ -158,8 +175,8 @@ public class GeyserSessionAdapter extends SessionAdapter {
             session.sendMessage("Loading your locale (en_us); if this isn't already downloaded, this may take some time");
         }
 
-        // Download and load the language for the player
-        MinecraftLocale.downloadAndLoadLocale(locale);
+        // Download and load the language for the player, off this event loop
+        MinecraftLocale.downloadAndLoadLocaleAsync(locale);
     }
 
     @Override

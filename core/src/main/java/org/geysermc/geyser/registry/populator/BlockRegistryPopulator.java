@@ -131,6 +131,12 @@ public final class BlockRegistryPopulator {
         // Safe to intern since Cloudburst NBT is immutable
         //noinspection UnstableApiUsage
         Interner<NbtMap> statesInterner = Interners.newStrongInterner();
+        // Most block states are identical across palette versions; share one instance of each outer
+        // {name, states} map and of each name string instead of keeping a copy per version
+        //noinspection UnstableApiUsage
+        Interner<NbtMap> blockInterner = Interners.newStrongInterner();
+        //noinspection UnstableApiUsage
+        Interner<String> nameInterner = Interners.newStrongInterner();
 
         for (ObjectIntPair<String> palette : blockMappers.keySet()) {
             int protocolVersion = palette.valueInt();
@@ -148,8 +154,11 @@ public final class BlockRegistryPopulator {
                     builder.remove("network_id"); // Added in 1.19.80
                     builder.remove("block_id"); // Added in 1.20.60
                     //noinspection UnstableApiUsage
+                    builder.putString("name", nameInterner.intern(builder.get("name").toString()));
+                    //noinspection UnstableApiUsage
                     builder.putCompound("states", statesInterner.intern((NbtMap) builder.remove("states")));
-                    vanillaBlockStates.set(i, builder.build());
+                    //noinspection UnstableApiUsage
+                    vanillaBlockStates.set(i, blockInterner.intern(builder.build()));
                 }
 
                 blockStates = new ArrayList<>(vanillaBlockStates);
@@ -182,6 +191,9 @@ public final class BlockRegistryPopulator {
                     customBlockProperties.add(CustomBlockRegistryPopulator.generateBlockPropertyData(customBlock));
                     CustomBlockRegistryPopulator.generateCustomBlockStates(customBlock, customBlockStates, customExtBlockStates);
                 }
+                // Custom block states are generated identically for every version, so share them too
+                //noinspection UnstableApiUsage
+                customBlockStates.replaceAll(blockInterner::intern);
                 blockStates.addAll(customBlockStates);
                 GeyserImpl.getInstance().getLogger().debug("Added " + customBlockStates.size() + " custom block states to v" + protocolVersion + " palette.");
 

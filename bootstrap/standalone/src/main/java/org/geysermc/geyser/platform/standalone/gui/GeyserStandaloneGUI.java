@@ -25,6 +25,7 @@
 
 package org.geysermc.geyser.platform.standalone.gui;
 
+import io.netty.util.concurrent.DefaultThreadFactory;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.logging.log4j.core.Logger;
@@ -58,6 +59,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Vector;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -264,14 +266,20 @@ public class GeyserStandaloneGUI {
     }
 
     /**
-     * Enables the command input box.
+     * Enables the command input box. Commands run on Geyser's current scheduled thread, looked up per command because
+     * a reload replaces it.
      *
-     * @param executor the executor that commands will be run on
      * @param registry the command registry containing all current commands
      */
-    public void enableCommands(ScheduledExecutorService executor, CommandRegistry registry) {
+    public void enableCommands(CommandRegistry registry) {
         // we don't want to block the GUI thread with the command execution
-        commandListener.dispatcher = cmd -> executor.execute(() -> registry.runCommand(logger, cmd));
+        commandListener.dispatcher = cmd -> {
+            try {
+                GeyserImpl.getInstance().getScheduledThread().execute(() -> registry.runCommand(logger, cmd));
+            } catch (RejectedExecutionException e) {
+                logger.error("Geyser is not running; unable to run command " + cmd);
+            }
+        };
         commandInput.setEnabled(true);
         commandInput.requestFocusInWindow();
     }
@@ -280,7 +288,7 @@ public class GeyserStandaloneGUI {
      * Start the thread to update the form information every 1s
      */
     public void startUpdateThread() {
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(new DefaultThreadFactory("Geyser GUI Updater", true));
 
         Runnable periodicTask = () -> {
             if (GeyserImpl.getInstance() != null) {
@@ -289,7 +297,7 @@ public class GeyserStandaloneGUI {
 
                 for (GeyserSession player : GeyserImpl.getInstance().getSessionManager().getSessions().values()) {
                     Vector<String> row = new Vector<>();
-                    row.add(player.getSocketAddress().getHostName());
+                    row.add(player.getSocketAddress().getHostString());
                     row.add(player.getPlayerEntity().getUsername());
 
                     playerTableModel.addRow(row);

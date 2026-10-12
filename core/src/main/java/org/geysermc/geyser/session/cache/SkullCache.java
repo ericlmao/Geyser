@@ -146,6 +146,30 @@ public class SkullCache {
         }
     }
 
+    /**
+     * Removes every skull in the given chunk. Positions are collected first and removed afterwards,
+     * since removing from the map while iterating it is unsafe.
+     */
+    public void removeSkullsInChunk(int chunkX, int chunkZ) {
+        if (skulls.isEmpty()) {
+            return;
+        }
+        List<Vector3i> removed = null;
+        for (Vector3i position : skulls.keySet()) {
+            if ((position.getX() >> 4) == chunkX && (position.getZ() >> 4) == chunkZ) {
+                if (removed == null) {
+                    removed = new ArrayList<>();
+                }
+                removed.add(position);
+            }
+        }
+        if (removed != null) {
+            for (Vector3i position : removed) {
+                removeSkull(position);
+            }
+        }
+    }
+
     public Skull updateSkull(Vector3i position, BlockState blockState) {
         Skull skull = skulls.get(position);
         if (skull != null) {

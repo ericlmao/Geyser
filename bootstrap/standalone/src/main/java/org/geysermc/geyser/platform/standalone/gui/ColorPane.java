@@ -38,6 +38,15 @@ public class ColorPane extends JTextPane {
     @Serial
     private static final long serialVersionUID = 1L;
 
+    /**
+     * Maximum number of characters kept in the console; older text is trimmed from the start
+     */
+    private static final int MAX_DOCUMENT_LENGTH = 512 * 1024;
+    /**
+     * Extra number of characters removed when trimming, so we don't have to trim on every append
+     */
+    private static final int TRIM_CHUNK = 64 * 1024;
+
     private static Color colorCurrent = ANSIColor.RESET.getColor();
     private String remaining = "";
 
@@ -49,10 +58,22 @@ public class ColorPane extends JTextPane {
     private void append(Color c, String s) {
         StyleContext sc = StyleContext.getDefaultStyleContext();
         AttributeSet aset = sc.addAttribute(SimpleAttributeSet.EMPTY, StyleConstants.Foreground, c);
-        int len = getDocument().getLength();
+        Document doc = getDocument();
+        int len = doc.getLength();
 
         try {
-            getDocument().insertString(len, s, aset);
+            doc.insertString(len, s, aset);
+
+            // Only called on the EDT, so no synchronization is needed
+            if (doc.getLength() > MAX_DOCUMENT_LENGTH) {
+                int cut = doc.getLength() - MAX_DOCUMENT_LENGTH + TRIM_CHUNK;
+                // Cut after the next newline so we don't leave a partial line at the top
+                int newline = doc.getText(cut, Math.min(4096, doc.getLength() - cut)).indexOf('\n');
+                if (newline != -1) {
+                    cut += newline + 1;
+                }
+                doc.remove(0, cut);
+            }
         } catch (BadLocationException e) {
             e.printStackTrace();
         }

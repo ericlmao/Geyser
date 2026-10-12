@@ -26,6 +26,7 @@
 package org.geysermc.geyser.translator.protocol.bedrock.entity;
 
 import org.cloudburstmc.protocol.bedrock.packet.EntityEventPacket;
+import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.inventory.MerchantContainer;
 import org.geysermc.geyser.session.GeyserSession;
 import org.geysermc.geyser.translator.protocol.PacketTranslator;
@@ -58,6 +59,9 @@ public class BedrockEntityEventTranslator extends PacketTranslator<EntityEventPa
                 return;
             }
         }
-        session.getGeyser().getLogger().debug("Did not translate incoming EntityEventPacket: " + packet);
+        GeyserLogger logger = session.getGeyser().getLogger();
+        if (logger.isDebug()) {
+            logger.debug("Did not translate incoming EntityEventPacket: " + packet);
+        }
     }
 }

@@ -119,9 +119,10 @@ public final class NetherNetServer implements EventRegistrar {
     private final GameOutcomeReporter gameOutcomes = new GameOutcomeReporter();
     private volatile Supplier<ServerStatus> providerStatusSupplier = this::collectServerStatus;
 
-    private EventLoopGroup eventLoopGroup;
-    private Channel netherNetChannel;
-    private NetherNetChannelInitialiser providerInitialiser;
+    // Written on the blocking executor while startProvider runs, read by shutdown()
+    private volatile EventLoopGroup eventLoopGroup;
+    private volatile Channel netherNetChannel;
+    private volatile NetherNetChannelInitialiser providerInitialiser;
     private NetherNetServerSignaling signaling;
     private EventLoopGroup inbuiltEventLoopGroup;
     private Channel inbuiltChannel;
@@ -378,6 +379,7 @@ public final class NetherNetServer implements EventRegistrar {
                 synchronized (providerLifecycle) {
                     if (stopping) {
                         client.close();
+                        closeNetworkResources();
                         return;
                     }
                     try {
@@ -413,7 +415,7 @@ public final class NetherNetServer implements EventRegistrar {
                 } catch (IOException ignored) {
                 }
             }
-        });
+        }, geyser.blockingExecutor());
     }
 
     private ServerStatus collectServerStatus() {

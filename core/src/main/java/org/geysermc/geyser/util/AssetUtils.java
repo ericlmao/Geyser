@@ -39,9 +39,10 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayDeque;
 import java.util.HashMap;
 import java.util.List;
@@ -136,7 +137,7 @@ public final class AssetUtils {
                 GeyserImpl.getInstance().getLogger().error(GeyserLocale.getLocaleStringLog("geyser.locale.fail.asset_cache", (!e.getMessage().isEmpty() ? e.getMessage() : e.getStackTrace())));
             }
             return null;
-        });
+        }, GeyserImpl.getInstance().blockingExecutor());
     }
 
     public static void downloadAndRunClientJarTasks() {
@@ -201,8 +202,20 @@ public final class AssetUtils {
     }
 
     public static void saveFile(Path location, InputStream fileStream) throws IOException {
-        try (OutputStream outStream = Files.newOutputStream(location)) {
-            fileStream.transferTo(outStream);
+        // Write next to the target and move it into place, so concurrent readers never see a partial file
+        Path tmp = location.resolveSibling(location.getFileName() + ".tmp");
+        try {
+            Files.copy(fileStream, tmp, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tmp, location, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, location, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {
+            }
         }
     }
 
