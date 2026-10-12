@@ -46,7 +46,9 @@ import org.geysermc.geyser.GeyserLogger;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
@@ -56,6 +58,12 @@ import java.util.function.Consumer;
  */
 public class PendingMicrosoftAuthentication {
     public static final HttpClient AUTH_CLIENT = MinecraftAuth.createHttpClient();
+    /**
+     * The device code flow blocks for up to the pending authentication timeout while polling Microsoft.
+     * Run it on virtual threads so it never occupies a {@link java.util.concurrent.ForkJoinPool#commonPool()} worker.
+     */
+    private static final ExecutorService AUTH_EXECUTOR = Executors.newThreadPerTaskExecutor(
+        Thread.ofVirtual().name("Geyser MSA auth-", 0).factory());
     /**
      * For GeyserConnect usage.
      */
@@ -88,25 +96,43 @@ public class PendingMicrosoftAuthentication {
     }
 
     public class AuthenticationTask {
-        private static final Executor DELAYED_BY_ONE_SECOND = CompletableFuture.delayedExecutor(1, TimeUnit.SECONDS);
+        private static final long START_DELAY_MILLIS = TimeUnit.SECONDS.toMillis(1);
 
         private final String userKey;
         private final int timeoutSec;
         @Getter
-        private CompletableFuture<JavaAuthManager> authentication;
+        private volatile CompletableFuture<JavaAuthManager> authentication;
+        /**
+         * The result future of the current login attempt; used to tell whether a completing attempt is still the current one.
+         */
+        private volatile CompletableFuture<JavaAuthManager> currentAttempt;
+        /**
+         * Handle of the blocking poll of the current login attempt. Cancelling it interrupts the polling thread.
+         */
+        private volatile Future<?> runningPoll;
 
         private AuthenticationTask(String userKey, int timeoutSec) {
             this.userKey = userKey;
             this.timeoutSec = timeoutSec;
         }
 
-        public void resetRunningFlow() {
+        public synchronized void resetRunningFlow() {
             if (authentication == null) {
                 return;
             }
 
             // Interrupt the current flow
             this.authentication.cancel(true);
+            CompletableFuture<JavaAuthManager> attempt = this.currentAttempt;
+            if (attempt != null) {
+                attempt.cancel(true);
+            }
+            // Cancelling the CompletableFuture does not stop the blocking poll; interrupt the thread running it
+            Future<?> poll = this.runningPoll;
+            if (poll != null) {
+                poll.cancel(true);
+                this.runningPoll = null;
+            }
         }
 
         public void cleanup() {
@@ -114,26 +140,37 @@ public class PendingMicrosoftAuthentication {
             if (logger.isDebug()) {
                 logger.debug("Cleaning up authentication task for " + userKey);
             }
-            authentications.invalidate(userKey);
+            // Only remove this task - a newer task may already exist for the same user
+            authentications.asMap().remove(userKey, this);
         }
 
-        public CompletableFuture<JavaAuthManager> performLoginAttempt(boolean offlineAccess, Consumer<MsaDeviceCode> deviceCodeConsumer) {
+        public synchronized CompletableFuture<JavaAuthManager> performLoginAttempt(boolean offlineAccess, Consumer<MsaDeviceCode> deviceCodeConsumer) {
             MsaApplicationConfig applicationConfig = GeyserImpl.OAUTH_CONFIG.withScope(offlineAccess ? MsaConstants.SCOPE_OFFLINE_ACCESS : MsaConstants.SCOPE_NO_OFFLINE_ACCESS);
             DeviceCodeMsaAuthService authService = new DeviceCodeMsaAuthService(AUTH_CLIENT, applicationConfig, deviceCodeConsumer, timeoutSec * 1000);
-            return authentication = CompletableFuture.supplyAsync(() -> {
+            CompletableFuture<JavaAuthManager> attempt = new CompletableFuture<>();
+            this.currentAttempt = attempt;
+            authentication = attempt.whenComplete((r, ex) -> {
+                // avoid memory leak, in case player doesn't connect again
+                CompletableFuture.delayedExecutor(timeoutSec, TimeUnit.SECONDS).execute(() -> {
+                    // A stale attempt must not evict a newer flow
+                    if (this.currentAttempt == attempt) {
+                        cleanup();
+                    }
+                });
+            });
+            runningPoll = AUTH_EXECUTOR.submit(() -> {
                 try {
+                    Thread.sleep(START_DELAY_MILLIS);
                     MsaToken msaToken = authService.acquireToken();
                     JavaAuthManager authManager = JavaAuthManager.create(AUTH_CLIENT).msaApplicationConfig(applicationConfig).login(msaToken);
                     authManager.getMinecraftToken().refresh(); // Preload the Minecraft token
                     authManager.getMinecraftProfile().refresh(); // Preload the Minecraft profile
-                    return authManager;
-                } catch (Exception e) {
-                    throw new CompletionException(e);
+                    attempt.complete(authManager);
+                } catch (Throwable e) {
+                    attempt.completeExceptionally(e instanceof CompletionException ? e : new CompletionException(e));
                 }
-            }, DELAYED_BY_ONE_SECOND).whenComplete((r, ex) -> {
-                // avoid memory leak, in case player doesn't connect again
-                CompletableFuture.delayedExecutor(timeoutSec, TimeUnit.SECONDS).execute(this::cleanup);
             });
+            return authentication;
         }
 
         @Override

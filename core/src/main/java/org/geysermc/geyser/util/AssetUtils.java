@@ -136,7 +136,7 @@ public final class AssetUtils {
                 GeyserImpl.getInstance().getLogger().error(GeyserLocale.getLocaleStringLog("geyser.locale.fail.asset_cache", (!e.getMessage().isEmpty() ? e.getMessage() : e.getStackTrace())));
             }
             return null;
-        });
+        }, GeyserImpl.getInstance().blockingExecutor());
     }
 
     public static void downloadAndRunClientJarTasks() {

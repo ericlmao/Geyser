@@ -311,7 +311,7 @@ public class ResourcePackLoader implements RegistryLoader<Path, Map<UUID, Resour
             }
 
             return new GeyserPathPackCodec(path);
-        });
+        }, GeyserImpl.getInstance().blockingExecutor());
     }
 
     public static void clear() {

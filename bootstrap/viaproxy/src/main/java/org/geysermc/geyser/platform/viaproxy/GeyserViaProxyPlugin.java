@@ -167,21 +167,25 @@ public class GeyserViaProxyPlugin extends ViaProxyPlugin implements GeyserBootst
         if (geyser == null) {
             return;
         }
-        boolean reloading = geyser.isReloading();
-        if (reloading) {
+        if (geyser.isReloading()) {
             geyserConfig = loadConfig(GeyserPluginConfig.class);
             if (geyserConfig == null) {
                 return;
             }
-        } else {
-            // Only initialized once - documented in the Geyser-Standalone bootstrap
+        }
+
+        // Only initialized once - documented in the Geyser-Standalone bootstrap.
+        // Gate on state rather than the reload flag, as a proxy restart re-enables Geyser without reloading
+        boolean createdCommandRegistry = false;
+        if (this.commandRegistry == null) {
             this.cloud = new StandaloneCloudCommandManager(geyser);
             this.commandRegistry = new CommandRegistry(geyser, cloud);
+            createdCommandRegistry = true;
         }
 
         GeyserImpl.start();
 
-        if (!reloading) {
+        if (createdCommandRegistry) {
             // Event must be fired after CommandRegistry has subscribed its listener.
             // Also, the subscription for the Permissions class is created when Geyser is initialized (by GeyserImpl#start)
             this.cloud.fireRegisterPermissionsEvent();

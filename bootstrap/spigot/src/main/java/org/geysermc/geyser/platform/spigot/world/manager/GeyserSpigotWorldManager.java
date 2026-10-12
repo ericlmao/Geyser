@@ -41,6 +41,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.entity.player.GameMode;
 
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
@@ -56,7 +57,7 @@ public class GeyserSpigotWorldManager extends WorldManager {
     @Override
     public int getBlockAt(GeyserSession session, int x, int y, int z) {
         Player bukkitPlayer;
-        if ((bukkitPlayer = Bukkit.getPlayer(session.getPlayerEntity().getUsername())) == null) {
+        if ((bukkitPlayer = Bukkit.getPlayer(session.getPlayerEntity().uuid())) == null) {
             return org.geysermc.geyser.level.block.type.Block.JAVA_AIR_ID;
         }
         World world = bukkitPlayer.getWorld();
@@ -73,7 +74,12 @@ public class GeyserSpigotWorldManager extends WorldManager {
             // Terrible behavior, but this is basically what's always been happening behind the scenes anyway.
             CompletableFuture<String> blockData = new CompletableFuture<>();
             Bukkit.getRegionScheduler().execute(this.plugin, block.getLocation(), () -> blockData.complete(block.getBlockData().getAsString()));
-            return BlockRegistries.JAVA_BLOCK_STATE_IDENTIFIER_TO_ID.getOrDefault(blockData.join(), org.geysermc.geyser.level.block.type.Block.JAVA_AIR_ID);
+            // Bound the wait: this is usually called from the session's event loop, which must not hang if the region task never runs
+            String blockDataString = blockData.completeOnTimeout(null, 50, TimeUnit.MILLISECONDS).join();
+            if (blockDataString == null) {
+                return org.geysermc.geyser.level.block.type.Block.JAVA_AIR_ID;
+            }
+            return BlockRegistries.JAVA_BLOCK_STATE_IDENTIFIER_TO_ID.getOrDefault(blockDataString, org.geysermc.geyser.level.block.type.Block.JAVA_AIR_ID);
         }
         return BlockRegistries.JAVA_BLOCK_STATE_IDENTIFIER_TO_ID.getOrDefault(block.getBlockData().getAsString(), org.geysermc.geyser.level.block.type.Block.JAVA_AIR_ID); // TODO could just make this a BlockState lookup?
     }
