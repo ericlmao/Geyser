@@ -44,20 +44,23 @@ import org.geysermc.geyser.inventory.GeyserItemStack;
 import org.geysermc.geyser.inventory.item.StoredItemMappings;
 import org.geysermc.geyser.item.Items;
 import org.geysermc.geyser.item.type.Item;
+import org.geysermc.geyser.registry.Registries;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.WeakHashMap;
 
 @Builder
 @Value
 public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
 
-    Map<String, ItemMapping> cachedJavaMappings = new WeakHashMap<>();
-
     ItemMapping[] items;
+
+    /**
+     * {@link #items} (excluding {@link ItemMapping#AIR}) grouped by Bedrock runtime id, in index order.
+     */
+    Int2ObjectMap<List<ItemMapping>> mappingsByBedrockRuntimeId;
 
     /**
      * A unique exception as this is an item in Bedrock, but not in Java.
@@ -68,6 +71,10 @@ public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
     List<CreativeItemGroup> creativeItemGroups;
     List<CreativeItemData> creativeItems;
     Int2ObjectMap<ItemDefinition> itemDefinitions;
+    /**
+     * {@link #itemDefinitions} keyed by Bedrock identifier; the first definition in iteration order wins.
+     */
+    Map<String, ItemDefinition> definitionsByIdentifier;
 
     StoredItemMappings storedItems;
     Set<Item> javaOnlyItems;
@@ -132,14 +139,14 @@ public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
      */
     @Nullable
     public ItemMapping getMapping(String javaIdentifier) {
-        return this.cachedJavaMappings.computeIfAbsent(javaIdentifier, key -> {
-            for (ItemMapping mapping : this.items) {
-                if (mapping.getJavaItem().javaIdentifier().equals(key)) {
-                    return mapping;
-                }
-            }
+        // JAVA_ITEM_IDENTIFIERS is only written during registry population, so this needs no synchronisation
+        Item item = Registries.JAVA_ITEM_IDENTIFIERS.get(javaIdentifier);
+        if (item == null) {
             return null;
-        });
+        }
+        ItemMapping mapping = getMapping(item.javaId());
+        // A Java item without a mapping in this version is backed by ItemMapping.AIR; keep returning null for it
+        return mapping.getJavaItem().javaIdentifier().equals(javaIdentifier) ? mapping : null;
     }
 
     /**
@@ -165,8 +172,9 @@ public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
         boolean isBlock = isValidBlockItem(data);
         boolean hasDamage = data.getDamage() != 0;
 
-        for (ItemMapping mapping : this.items) {
-            if (mapping.getBedrockDefinition().getRuntimeId() == definition.getRuntimeId()) {
+        List<ItemMapping> candidates = this.mappingsByBedrockRuntimeId.get(definition.getRuntimeId());
+        if (candidates != null) {
+            for (ItemMapping mapping : candidates) {
                 if (isBlock && !hasDamage) { // Pre-1.16.220 will not use block runtime IDs at all, so we shouldn't check either
                     if (data.getBlockDefinition() != mapping.getBedrockBlockDefinition()) {
                         continue;
@@ -185,7 +193,9 @@ public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
             }
         }
 
-        GeyserImpl.getInstance().getLogger().debug("Missing mapping for bedrock item " + data);
+        if (GeyserImpl.getInstance().getLogger().isDebug()) {
+            GeyserImpl.getInstance().getLogger().debug("Missing mapping for bedrock item " + data);
+        }
         return ItemMapping.AIR;
     }
 
@@ -219,12 +229,7 @@ public class ItemMappings implements DefinitionRegistry<ItemDefinition> {
 
     @Nullable
     public ItemDefinition getDefinition(String bedrockIdentifier) {
-        for (ItemDefinition itemDefinition : this.itemDefinitions.values()) {
-            if (itemDefinition.getIdentifier().equals(bedrockIdentifier)) {
-                return itemDefinition;
-            }
-        }
-        return null;
+        return this.definitionsByIdentifier.get(bedrockIdentifier);
     }
 
     @Override

@@ -32,7 +32,6 @@ import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap;
 import net.kyori.adventure.key.Key;
 import org.cloudburstmc.nbt.NbtMap;
-import org.cloudburstmc.nbt.NbtMapBuilder;
 import org.cloudburstmc.protocol.bedrock.data.biome.BiomeDefinitions;
 import org.cloudburstmc.protocol.bedrock.data.inventory.crafting.PotionMixData;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
@@ -81,7 +80,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -106,12 +104,6 @@ public final class Registries {
      * A registry containing all the Bedrock packet translators.
      */
     public static final PacketTranslatorRegistry<BedrockPacket> BEDROCK_PACKET_TRANSLATORS = PacketTranslatorRegistry.create();
-
-    /**
-     * A registry holding a NbtMap of all the known biomes.
-     * Remove once 1.21.80 is lowest supported version - replaced by {@link Registries#BIOMES}
-     */
-    public static final SimpleDeferredRegistry<NbtMap> BIOMES_NBT = SimpleDeferredRegistry.create("bedrock/biome_definitions.dat", RegistryLoaders.NBT);
 
     /**
      * A registry holding biome data for all known biomes.
@@ -244,7 +236,6 @@ public final class Registries {
         DataComponentRegistryPopulator.load();
 
         BEDROCK_ENTITY_IDENTIFIERS.load();
-        BIOMES_NBT.load();
         BIOMES.load();
         BIOME_IDENTIFIERS.load();
         BLOCK_ENTITIES.load();
@@ -268,18 +259,5 @@ public final class Registries {
 
         // potion mixes depend on other registries
         POTION_MIXES.load();
-
-        // Remove unneeded client generation data from NbtMapBuilder
-        NbtMapBuilder biomesNbt = NbtMap.builder();
-        for (Map.Entry<String, Object> entry : BIOMES_NBT.get().entrySet()) {
-            String key = entry.getKey();
-            NbtMapBuilder value = ((NbtMap) entry.getValue()).toBuilder();
-            value.remove("minecraft:consolidated_features");
-            value.remove("minecraft:multinoise_generation_rules");
-            value.remove("minecraft:surface_material_adjustments");
-            value.remove( "minecraft:surface_parameters");
-            biomesNbt.put(key, value.build());
-        }
-        BIOMES_NBT.set(biomesNbt.build());
     }
 }

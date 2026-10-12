@@ -25,9 +25,18 @@
 
 package org.geysermc.geyser.registry.type;
 
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.cloudburstmc.protocol.bedrock.data.LevelEvent;
+import org.cloudburstmc.protocol.bedrock.data.SoundEvent;
+
+/**
+ * @param soundEvent the resolved Bedrock level sound event, or null if neither {@code bedrock} nor {@code java} maps to one
+ * @param levelEventType the resolved Bedrock level event if {@code levelEvent} is set, or null if it is unset or {@code bedrock} is not a valid level event
+ */
 public record SoundMapping(String java, String bedrock, String playsound, int extraData, String identifier,
-                           boolean levelEvent, float pitchAdjust) {
-    public SoundMapping(String java, String bedrock, String playsound, int extraData, String identifier, boolean levelEvent, float pitchAdjust) {
+                           boolean levelEvent, float pitchAdjust, @Nullable SoundEvent soundEvent, @Nullable LevelEvent levelEventType) {
+    public SoundMapping(String java, String bedrock, String playsound, int extraData, String identifier, boolean levelEvent, float pitchAdjust,
+                        @Nullable SoundEvent soundEvent, @Nullable LevelEvent levelEventType) {
         this.java = java;
         this.bedrock = bedrock == null || bedrock.isEmpty() ? null : bedrock;
         this.playsound = playsound == null || playsound.isEmpty() ? null : playsound;
@@ -35,5 +44,21 @@ public record SoundMapping(String java, String bedrock, String playsound, int ex
         this.identifier = identifier == null || identifier.isEmpty() ? ":" : identifier;
         this.levelEvent = levelEvent;
         this.pitchAdjust = pitchAdjust;
+        this.soundEvent = soundEvent;
+        this.levelEventType = levelEventType;
+    }
+
+    /**
+     * Creates a mapping without resolved Bedrock events.
+     */
+    public SoundMapping(String java, String bedrock, String playsound, int extraData, String identifier, boolean levelEvent, float pitchAdjust) {
+        this(java, bedrock, playsound, extraData, identifier, levelEvent, pitchAdjust, null, null);
+    }
+
+    /**
+     * @return a copy of this mapping with the given resolved Bedrock events
+     */
+    public SoundMapping withResolvedEvents(@Nullable SoundEvent soundEvent, @Nullable LevelEvent levelEventType) {
+        return new SoundMapping(java, bedrock, playsound, extraData, identifier, levelEvent, pitchAdjust, soundEvent, levelEventType);
     }
 }

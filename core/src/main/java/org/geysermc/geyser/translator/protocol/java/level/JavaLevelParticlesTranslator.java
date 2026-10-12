@@ -46,6 +46,7 @@ import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelEventGenericPacket;
 import org.cloudburstmc.protocol.bedrock.packet.LevelEventPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SpawnParticleEffectPacket;
+import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.entity.type.Entity;
 import org.geysermc.geyser.registry.Registries;
 import org.geysermc.geyser.registry.type.ParticleMapping;
@@ -63,6 +64,14 @@ import java.util.function.Function;
 @Translator(packet = ClientboundLevelParticlesPacket.class)
 public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLevelParticlesPacket> {
     private static final int MAX_PARTICLES = 100;
+
+    // Constant colours; built once instead of per particle
+    private static final String GLOW_LIGHT_MOLANG = colorMolang(0.6f, 1.0f, 0.8f);
+    private static final String GLOW_DARK_MOLANG = colorMolang(0.08f, 0.4f, 0.4f);
+    private static final String WAX_ON_MOLANG = colorMolang(0.91f, 0.55f, 0.08f);
+    private static final String WAX_OFF_MOLANG = colorMolang(1.0f, 0.9f, 1.0f);
+    private static final String SCRAPE_DARK_MOLANG = colorMolang(0.29f, 0.58f, 0.51f);
+    private static final String SCRAPE_LIGHT_MOLANG = colorMolang(0.43f, 0.77f, 0.62f);
 
     @Override
     public void translate(GeyserSession session, ClientboundLevelParticlesPacket packet) {
@@ -86,7 +95,10 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
             }
         } else {
             // Null is only returned when no particle of this type is found
-            session.getGeyser().getLogger().debug("Unhandled particle packet: " + packet);
+            GeyserLogger logger = session.getGeyser().getLogger();
+            if (logger.isDebug()) {
+                logger.debug("Unhandled particle packet: " + packet);
+            }
         }
     }
 
@@ -194,12 +206,13 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
                 float red = ((rgbData >> 16) & 0xFF) / 255f;
                 float green = ((rgbData >> 8) & 0xFF) / 255f;
                 float blue = (rgbData & 0xFF) / 255f;
+                String molang = colorMolang(red, green, blue);
                 return (position) -> {
                     SpawnParticleEffectPacket particlePacket = new SpawnParticleEffectPacket();
                     particlePacket.setIdentifier("minecraft:biome_tinted_leaves_particle");
                     particlePacket.setDimensionId(dimensionId);
                     particlePacket.setPosition(position);
-                    particlePacket.setMolangVariablesJson(Optional.of(colorMolang(red, green, blue)));
+                    particlePacket.setMolangVariablesJson(Optional.of(molang));
                     return particlePacket;
                 };
             }
@@ -212,8 +225,8 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
                     particlePacket.setPosition(position);
                     // The Java client randomly picks a light or dark cyan for each particle
                     particlePacket.setMolangVariablesJson(Optional.of(ThreadLocalRandom.current().nextBoolean()
-                            ? colorMolang(0.6f, 1.0f, 0.8f)
-                            : colorMolang(0.08f, 0.4f, 0.4f)));
+                            ? GLOW_LIGHT_MOLANG
+                            : GLOW_DARK_MOLANG));
                     return particlePacket;
                 };
             }
@@ -224,7 +237,7 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
                     particlePacket.setIdentifier("minecraft:wax_particle");
                     particlePacket.setDimensionId(dimensionId);
                     particlePacket.setPosition(position);
-                    particlePacket.setMolangVariablesJson(Optional.of(colorMolang(0.91f, 0.55f, 0.08f)));
+                    particlePacket.setMolangVariablesJson(Optional.of(WAX_ON_MOLANG));
                     return particlePacket;
                 };
             }
@@ -235,7 +248,7 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
                     particlePacket.setIdentifier("minecraft:wax_particle");
                     particlePacket.setDimensionId(dimensionId);
                     particlePacket.setPosition(position);
-                    particlePacket.setMolangVariablesJson(Optional.of(colorMolang(1.0f, 0.9f, 1.0f)));
+                    particlePacket.setMolangVariablesJson(Optional.of(WAX_OFF_MOLANG));
                     return particlePacket;
                 };
             }
@@ -248,8 +261,8 @@ public class JavaLevelParticlesTranslator extends PacketTranslator<ClientboundLe
                     particlePacket.setPosition(position);
                     // The Java client randomly picks a dark or light teal for each particle
                     particlePacket.setMolangVariablesJson(Optional.of(ThreadLocalRandom.current().nextBoolean()
-                            ? colorMolang(0.29f, 0.58f, 0.51f)
-                            : colorMolang(0.43f, 0.77f, 0.62f)));
+                            ? SCRAPE_DARK_MOLANG
+                            : SCRAPE_LIGHT_MOLANG));
                     return particlePacket;
                 };
             }

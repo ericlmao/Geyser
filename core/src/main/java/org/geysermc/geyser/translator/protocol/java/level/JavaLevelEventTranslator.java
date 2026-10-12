@@ -39,7 +39,7 @@ import org.cloudburstmc.protocol.bedrock.packet.RecordStartedPacket;
 import org.cloudburstmc.protocol.bedrock.packet.SpawnParticleEffectPacket;
 import org.cloudburstmc.protocol.bedrock.packet.StopSoundPacket;
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket;
-import org.geysermc.geyser.GeyserImpl;
+import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.level.JukeboxSong;
 import org.geysermc.geyser.network.bedrock.GameProtocol;
 import org.geysermc.geyser.registry.Registries;
@@ -476,7 +476,10 @@ public class JavaLevelEventTranslator extends PacketTranslator<ClientboundLevelE
                 return;
             }
             default -> {
-                GeyserImpl.getInstance().getLogger().debug("Unhandled level event: " + packet.getEvent());
+                GeyserLogger logger = session.getGeyser().getLogger();
+                if (logger.isDebug()) {
+                    logger.debug("Unhandled level event: " + packet.getEvent());
+                }
                 return;
             }
         }

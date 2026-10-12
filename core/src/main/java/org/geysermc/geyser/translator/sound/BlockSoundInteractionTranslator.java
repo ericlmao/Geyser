@@ -50,15 +50,19 @@ public interface BlockSoundInteractionTranslator extends SoundInteractionTransla
     static void handleBlockInteraction(GeyserSession session, Vector3f position, BlockState state) {
         // If we need to get the hand identifier, only get it once and save it to a variable
         String handIdentifier = null;
+        // BlockState#toString builds a new string each call, so only build it once
+        String stateString = state.toString();
 
         for (Map.Entry<SoundTranslator, SoundInteractionTranslator<?>> interactionEntry : Registries.SOUND_TRANSLATORS.get().entrySet()) {
             if (!(interactionEntry.getValue() instanceof BlockSoundInteractionTranslator)) {
                 continue;
             }
-            if (interactionEntry.getKey().blocks().length != 0) {
+            // Annotation array accessors return a fresh clone on every call
+            String[] blocks = interactionEntry.getKey().blocks();
+            if (blocks.length != 0) {
                 boolean contains = false;
-                for (String blockIdentifier : interactionEntry.getKey().blocks()) {
-                    if (state.toString().contains(blockIdentifier)) {
+                for (String blockIdentifier : blocks) {
+                    if (stateString.contains(blockIdentifier)) {
                         contains = true;
                         break;
                     }
@@ -66,7 +70,8 @@ public interface BlockSoundInteractionTranslator extends SoundInteractionTransla
                 if (!contains) continue;
             }
             GeyserItemStack itemInHand = session.getPlayerInventory().getItemInHand();
-            if (interactionEntry.getKey().items().length != 0) {
+            String[] items = interactionEntry.getKey().items();
+            if (items.length != 0) {
                 if (itemInHand.isEmpty()) {
                     continue;
                 }
@@ -74,7 +79,7 @@ public interface BlockSoundInteractionTranslator extends SoundInteractionTransla
                     handIdentifier = itemInHand.asItem().javaIdentifier();
                 }
                 boolean contains = false;
-                for (String itemIdentifier : interactionEntry.getKey().items()) {
+                for (String itemIdentifier : items) {
                     if (handIdentifier.contains(itemIdentifier)) {
                         contains = true;
                         break;

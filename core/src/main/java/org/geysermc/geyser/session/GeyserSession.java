@@ -34,6 +34,7 @@ import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2IntMap;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import lombok.AccessLevel;
 import lombok.Getter;
@@ -428,7 +429,7 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
      * A map of Vector3i positions to Java entities.
      * Used for translating Bedrock block actions to Java entity actions.
      */
-    private final Map<Vector3i, ItemFrameEntity> itemFrameCache = new Object2ObjectOpenHashMap<>();
+    private final Object2ObjectMap<Vector3i, ItemFrameEntity> itemFrameCache = new Object2ObjectOpenHashMap<>();
 
     /**
      * A map of all players (and their heads) that are wearing a player head with a custom texture.

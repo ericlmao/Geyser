@@ -72,6 +72,7 @@ public class Item {
     public static final int BEDROCK_MAX_STACK_SIZE = 64;
     private static final Map<Block, Item> BLOCK_TO_ITEM = new HashMap<>();
     protected final Key javaIdentifier;
+    private final String javaIdentifierString; // cached javaIdentifier.asString(); Key is immutable
     private int javaId = -1;
     private final int attackDamage;
     private DataComponents baseComponents; // unmodifiable
@@ -82,6 +83,7 @@ public class Item {
 
     public Item(String javaIdentifier, Builder builder) {
         this.javaIdentifier = MinecraftKey.key(javaIdentifier);
+        this.javaIdentifierString = this.javaIdentifier.asString();
         this.attackDamage = builder.attackDamage;
         if (builder.components != null) {
             this.baseComponents = builder.components;
@@ -107,7 +109,7 @@ public class Item {
 
     // TODO maybe deprecate?
     public String javaIdentifier() {
-        return javaIdentifier.asString();
+        return javaIdentifierString;
     }
 
     public Key javaKey() {
@@ -167,6 +169,22 @@ public class Item {
 
         // Return an unmodifiable map of the merged components
         return new DataComponents(Collections.unmodifiableMap(base.getDataComponents()));
+    }
+
+    /**
+     * Returns whether this item's base components (including resolvable base components) contain the given type.
+     * Equivalent to {@code gatherComponents(resolvableGetter, null).contains(type)}, without cloning the component map.
+     */
+    public boolean hasBaseComponent(@NonNull ResolvableComponentGetter resolvableGetter, @NonNull DataComponentType<?> type) {
+        if (baseComponents.contains(type)) {
+            return true;
+        }
+        // Resolved components only ever contain entries for resolvableComponentTypes (see ResolvableComponent#resolve)
+        if (resolvableComponentTypes != null && resolvableComponentTypes.contains(type)) {
+            DataComponents resolvedComponents = resolvableGetter.getResolvedComponents(this);
+            return resolvedComponents != null && resolvedComponents.contains(type);
+        }
+        return false;
     }
 
     /**

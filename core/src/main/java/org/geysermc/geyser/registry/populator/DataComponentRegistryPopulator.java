@@ -70,6 +70,9 @@ public final class DataComponentRegistryPopulator {
             JsonArray jsonArray = rootElement.getAsJsonArray();
 
             defaultComponents = new ObjectArrayList<>(jsonArray.size());
+            // Many items share identical encoded components; decode each distinct value once and share the instance.
+            // The encoded value includes the component type, so it fully identifies the decoded component.
+            Map<String, DataComponent<?, ?>> decodedCache = new HashMap<>(4096);
 
             for (JsonElement element : jsonArray) {
                 JsonObject entryObject = element.getAsJsonObject();
@@ -79,13 +82,17 @@ public final class DataComponentRegistryPopulator {
 
                 for (Map.Entry<String, JsonElement> componentEntry : components.entrySet()) {
                     String encodedValue = componentEntry.getValue().getAsString();
-                    byte[] bytes = Base64.getDecoder().decode(encodedValue);
-                    ByteBuf buf = Unpooled.wrappedBuffer(bytes);
-                    int varInt = MinecraftTypes.readVarInt(buf);
-                    DataComponentType<?> dataComponentType = DataComponentTypes.from(varInt);
-                    DataComponent<?, ?> dataComponent = dataComponentType.readDataComponent(buf);
+                    DataComponent<?, ?> dataComponent = decodedCache.get(encodedValue);
+                    if (dataComponent == null) {
+                        byte[] bytes = Base64.getDecoder().decode(encodedValue);
+                        ByteBuf buf = Unpooled.wrappedBuffer(bytes);
+                        int varInt = MinecraftTypes.readVarInt(buf);
+                        DataComponentType<?> dataComponentType = DataComponentTypes.from(varInt);
+                        dataComponent = dataComponentType.readDataComponent(buf);
+                        decodedCache.put(encodedValue, dataComponent);
+                    }
 
-                    map.put(dataComponentType, dataComponent);
+                    map.put(dataComponent.getType(), dataComponent);
                 }
 
                 defaultComponents.add(new DataComponents(ImmutableMap.copyOf(map)));

@@ -28,8 +28,11 @@ package org.geysermc.geyser.registry.loader;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import org.cloudburstmc.protocol.bedrock.data.LevelEvent;
+import org.cloudburstmc.protocol.bedrock.data.SoundEvent;
 import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.registry.type.SoundMapping;
+import org.geysermc.geyser.util.SoundUtils;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -56,16 +59,36 @@ public class SoundRegistryLoader implements RegistryLoader<String, Map<String, S
         for (Map.Entry<String, JsonElement> entry : soundsJson.entrySet()) {
             JsonObject brMap = entry.getValue().getAsJsonObject();
             String javaSound = entry.getKey();
-            soundMappings.put(javaSound, new SoundMapping(
-                            javaSound,
-                            brMap.has("bedrock_mapping") ? brMap.get("bedrock_mapping").getAsString() : null,
-                            brMap.has("playsound_mapping") ? brMap.get("playsound_mapping").getAsString() : null,
-                            brMap.has("extra_data") ? brMap.get("extra_data").getAsInt() : -1,
-                            brMap.has("identifier") ? brMap.get("identifier").getAsString() : null,
-                            brMap.has("level_event") && brMap.get("level_event").getAsBoolean(),
-                            brMap.has("pitch_adjust") ? brMap.get("pitch_adjust").getAsFloat() : 1.0f
-                    )
+            SoundMapping mapping = new SoundMapping(
+                    javaSound,
+                    brMap.has("bedrock_mapping") ? brMap.get("bedrock_mapping").getAsString() : null,
+                    brMap.has("playsound_mapping") ? brMap.get("playsound_mapping").getAsString() : null,
+                    brMap.has("extra_data") ? brMap.get("extra_data").getAsInt() : -1,
+                    brMap.has("identifier") ? brMap.get("identifier").getAsString() : null,
+                    brMap.has("level_event") && brMap.get("level_event").getAsBoolean(),
+                    brMap.has("pitch_adjust") ? brMap.get("pitch_adjust").getAsFloat() : 1.0f
             );
+
+            // Resolve the Bedrock events once here instead of per played sound.
+            // Same fallback order as SoundUtils#playSound used: the Bedrock mapping first, then the Java sound name (the map key)
+            SoundEvent soundEvent = null;
+            if (mapping.bedrock() != null) {
+                soundEvent = SoundUtils.toSoundEvent(mapping.bedrock());
+            }
+            if (soundEvent == null) {
+                soundEvent = SoundUtils.toSoundEvent(javaSound);
+            }
+
+            LevelEvent levelEventType = null;
+            if (mapping.levelEvent()) {
+                levelEventType = mapping.bedrock() == null ? null : SoundUtils.toLevelEvent(mapping.bedrock());
+                if (levelEventType == null) {
+                    GeyserImpl.getInstance().getLogger().warning("Sound mapping " + javaSound + " is marked as a level event but '"
+                        + mapping.bedrock() + "' is not a valid LevelEvent");
+                }
+            }
+
+            soundMappings.put(javaSound, mapping.withResolvedEvents(soundEvent, levelEventType));
         }
         return soundMappings;
     }

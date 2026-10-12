@@ -59,6 +59,7 @@ import org.geysermc.geyser.text.ChatColor;
 import org.geysermc.geyser.text.MinecraftLocale;
 import org.geysermc.geyser.translator.text.MessageTranslator;
 import org.geysermc.geyser.util.InventoryUtils;
+import org.geysermc.geyser.util.MathUtils;
 import org.geysermc.geyser.util.MinecraftKey;
 import org.geysermc.mcprotocollib.auth.GameProfile;
 import org.geysermc.mcprotocollib.auth.texture.Texture;
@@ -78,7 +79,6 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.component.MobEffectIns
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.PotionContents;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.WrittenBookContent;
 
-import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashMap;
@@ -99,7 +99,6 @@ public final class ItemTranslator {
         ItemAttributeModifiers.EquipmentSlotGroup.LEGS,
         ItemAttributeModifiers.EquipmentSlotGroup.FEET
     };
-    private static final DecimalFormat ATTRIBUTE_FORMAT = new DecimalFormat("0.#####");
     private static final Key BASE_ATTACK_DAMAGE_ID = MinecraftKey.key("base_attack_damage");
     private static final Key BASE_ATTACK_SPEED_ID = MinecraftKey.key("base_attack_speed");
 
@@ -351,10 +350,10 @@ public final class ItemTranslator {
                     baseModifier = true;
                 }
 
-                yield ATTRIBUTE_FORMAT.format(amount);
+                yield MathUtils.formatAttributeAmount(amount);
             }
             case ADD_MULTIPLIED_BASE, ADD_MULTIPLIED_TOTAL ->
-                    ATTRIBUTE_FORMAT.format(amount * 100) + "%";
+                    MathUtils.formatAttributeAmount(amount * 100) + "%";
         };
         if (amount > 0 && !baseModifier) {
             operationTotal = "+" + operationTotal;
@@ -538,7 +537,9 @@ public final class ItemTranslator {
             return ItemDefinition.AIR;
         }
 
-        ItemMapping mapping = itemStack.asItem().toBedrockDefinition(itemStack.getAllComponents(), session.getItemMappings());
+        // Gather the merged components once; both lookups below receive the same (unmodifiable) view
+        DataComponents components = itemStack.getAllComponents();
+        ItemMapping mapping = itemStack.asItem().toBedrockDefinition(components, session.getItemMappings());
 
         ItemDefinition itemDefinition = mapping.getBedrockDefinition();
         CustomBlockData customBlockData = BlockRegistries.CUSTOM_BLOCK_ITEM_OVERRIDES.getOrDefault(
@@ -554,7 +555,7 @@ public final class ItemTranslator {
             }
         }
 
-        ItemDefinition definition = CustomItemTranslator.getCustomItem(session, itemStack.getAmount(), itemStack.getAllComponents(), mapping);
+        ItemDefinition definition = CustomItemTranslator.getCustomItem(session, itemStack.getAmount(), components, mapping);
         if (definition == null) {
             // No custom item
             return itemDefinition;
