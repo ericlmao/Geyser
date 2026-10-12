@@ -77,7 +77,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.IntFunction;
 
 public class InventoryUtils {
@@ -299,6 +301,9 @@ public class InventoryUtils {
     /**
      * Returns a barrier block with custom name and lore to explain why
      * part of the inventory is unusable.
+     * <p>
+     * The returned {@link ItemData} is memoised per protocol version and shared between all sessions,
+     * so it must never be mutated (e.g. via {@link ItemData#setNetId(int)}).
      *
      * @param description the description
      * @return the unusable space block
@@ -312,15 +317,30 @@ public class InventoryUtils {
         display.putList("Lore", NbtType.STRING, Collections.singletonList(ChatColor.RESET + ChatColor.DARK_PURPLE + description));
 
         root.put("display", display.build());
-        return protocolVersion -> ItemData.builder()
-                .definition(getUnusableSpaceBlockDefinition(protocolVersion))
-                .count(1)
-                .tag(root.build()).build();
+        NbtMap tag = root.build();
+
+        Map<Integer, UnusableSpaceBlock> perVersion = new ConcurrentHashMap<>(4);
+        return protocolVersion -> {
+            // Re-check the configured block so a config reload is still picked up
+            String unusableSpaceBlock = GeyserImpl.getInstance().config().gameplay().unusableSpaceBlock();
+            UnusableSpaceBlock cached = perVersion.get(protocolVersion);
+            if (cached == null || !cached.configuredBlock().equals(unusableSpaceBlock)) {
+                cached = new UnusableSpaceBlock(unusableSpaceBlock, ItemData.builder()
+                        .definition(getUnusableSpaceBlockDefinition(protocolVersion, unusableSpaceBlock))
+                        .count(1)
+                        .tag(tag).build());
+                perVersion.put(protocolVersion, cached);
+            }
+            // Shared instance - never mutate
+            return cached.itemData();
+        };
     }
 
-    private static ItemDefinition getUnusableSpaceBlockDefinition(int protocolVersion) {
+    private record UnusableSpaceBlock(String configuredBlock, ItemData itemData) {
+    }
+
+    private static ItemDefinition getUnusableSpaceBlockDefinition(int protocolVersion, String unusableSpaceBlock) {
         ItemMappings mappings = Registries.ITEMS.forVersion(protocolVersion);
-        String unusableSpaceBlock = GeyserImpl.getInstance().config().gameplay().unusableSpaceBlock();
         ItemDefinition itemDefinition = mappings.getDefinition(unusableSpaceBlock);
 
         if (itemDefinition == null) {

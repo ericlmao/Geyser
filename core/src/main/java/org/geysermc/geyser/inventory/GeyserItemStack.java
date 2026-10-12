@@ -199,7 +199,15 @@ public class GeyserItemStack {
      * @return whether this GeyserItemStack has the given {@code component}.
      */
     public boolean has(DataComponentType<?> component) {
-        return !isEmpty() && asItem().gatherComponents(resolvableComponentGetter, components).contains(component);
+        if (isEmpty()) {
+            return false;
+        }
+        // Equivalent to getAllComponents().contains(component) without building the merged map.
+        // A patch entry counts even when its value is null (a removal marker), matching gatherComponents' putAll + containsKey.
+        if (components != null && components.contains(component)) {
+            return true;
+        }
+        return asItem().hasBaseComponent(resolvableComponentGetter, component);
     }
 
     /**

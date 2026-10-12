@@ -57,6 +57,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.entity.attribute.AttributeT
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundCommandsPacket;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 @SuppressWarnings("removal") // We know. This is our doing.
@@ -64,12 +65,32 @@ import java.util.function.Supplier;
 public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommandsPacket> {
 
     /**
+     * Identity set ({@code String[]} uses identity equals/hashCode) of the process-static value arrays whose
+     * {@link CommandEnumData} may be shared across sessions via {@link #STATIC_ENUMS}. The eager arrays are added in
+     * the static initialiser; the memoised registry-derived arrays add themselves when first computed, so checking
+     * membership never forces a registry load.
+     */
+    private static final Set<String[]> STATIC_ARRAYS = ConcurrentHashMap.newKeySet();
+    /**
+     * Process-wide cache of enums built from {@link #STATIC_ARRAYS}, keyed by (enum name, array identity). Values are
+     * immutable and shared across sessions and threads. Bounded by (#static arrays x #enum names mapping to them).
+     * <p>
+     * The registry-derived arrays (blocks, items, entity types) are computed once per JVM, like {@link #ALL_BLOCK_NAMES}
+     * always has been; if the registries were ever re-populated in the same JVM, these enums would go stale together
+     * with those arrays.
+     */
+    private static final Map<EnumKey, CommandEnumData> STATIC_ENUMS = new ConcurrentHashMap<>();
+
+    /**
      * Wait until the registries load before getting all the block names.
      */
-    private static final Supplier<String[]> ALL_BLOCK_NAMES = Suppliers.memoize(() -> BlockRegistries.JAVA_BLOCKS.get().stream().map(block -> block.javaIdentifier().toString()).toArray(String[]::new));
+    private static final Supplier<String[]> ALL_BLOCK_NAMES = Suppliers.memoize(() -> registerStatic(BlockRegistries.JAVA_BLOCKS.get().stream().map(block -> block.javaIdentifier().toString()).toArray(String[]::new)));
+    private static final Supplier<String[]> ALL_ITEM_NAMES = Suppliers.memoize(() -> registerStatic(Registries.JAVA_ITEM_IDENTIFIERS.get().keySet().toArray(new String[0])));
+    private static final Supplier<String[]> ALL_ENTITY_TYPES = Suppliers.memoize(() -> registerStatic(Registries.JAVA_ENTITY_IDENTIFIERS.get().keySet().toArray(new String[0])));
     private static final String[] ALL_EFFECT_IDENTIFIERS = EntityUtils.getAllEffectIdentifiers();
     private static final String[] ATTRIBUTES = AttributeType.Builtin.BUILTIN.values().stream().map(type -> type.getIdentifier().asString()).toList().toArray(new String[0]);
-    private static final String[] ENUM_BOOLEAN = {"true", "false"};
+    // Package-private for JavaCommandsEnumCacheTest
+    static final String[] ENUM_BOOLEAN = {"true", "false"};
     private static final String[] VALID_COLORS;
     private static final String[] VALID_SCOREBOARD_SLOTS;
 
@@ -116,6 +137,17 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
             teamOptions.add("sidebar.team." + color);
         }
         VALID_SCOREBOARD_SLOTS = teamOptions.toArray(new String[0]);
+
+        registerStatic(ALL_EFFECT_IDENTIFIERS);
+        registerStatic(ATTRIBUTES);
+        registerStatic(ENUM_BOOLEAN);
+        registerStatic(VALID_COLORS);
+        registerStatic(VALID_SCOREBOARD_SLOTS);
+    }
+
+    private static String[] registerStatic(String[] array) {
+        STATIC_ARRAYS.add(array);
+        return array;
     }
 
     @Override
@@ -144,6 +176,8 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
 
         List<String> knownCommands = new ArrayList<>();
         List<String> restrictedCommands = new ArrayList<>();
+        // One context per packet so its memoised arrays and per-packet enums are shared by every command
+        CommandBuilderContext context = new CommandBuilderContext(session);
         // Loop through the root nodes to get all commands
         for (int nodeIndex : rootNode.getChildIndices()) {
             CommandNode node = nodes[nodeIndex];
@@ -159,7 +193,7 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
             }
 
             // Get and parse all params
-            CommandOverloadData[] params = getParams(session, nodes[nodeIndex], nodes);
+            CommandOverloadData[] params = getParams(context, nodes[nodeIndex], nodes);
 
             // Insert the alias name into the command list
             String name = node.getName().toLowerCase(Locale.ROOT);
@@ -256,12 +290,12 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
     /**
      * Build the command parameter array for the given command
      *
-     * @param session the session
+     * @param context the command builder context for this packet
      * @param commandNode The command to build the parameters for
      * @param allNodes    Every command node
      * @return An array of parameter option arrays
      */
-    private static CommandOverloadData[] getParams(GeyserSession session, CommandNode commandNode, CommandNode[] allNodes) {
+    private static CommandOverloadData[] getParams(CommandBuilderContext context, CommandNode commandNode, CommandNode[] allNodes) {
         // Check if the command is an alias and redirect it
         if (commandNode.getRedirectIndex().isPresent()) {
             int redirectIndex = commandNode.getRedirectIndex().getAsInt();
@@ -272,7 +306,7 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
         if (commandNode.getChildIndices().length >= 1) {
             // Create the root param node and build all the children
             ParamInfo rootParam = new ParamInfo(commandNode, null);
-            rootParam.buildChildren(new CommandBuilderContext(session), allNodes);
+            rootParam.buildChildren(context, allNodes);
 
             List<CommandOverloadData> treeData = rootParam.getTree();
 
@@ -307,7 +341,7 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
             case BOOL -> ENUM_BOOLEAN;
             case OPERATION -> CommandParam.OPERATOR; // ">=", "==", etc
             case BLOCK_STATE -> ALL_BLOCK_NAMES.get();
-            case ITEM_STACK -> context.getItemNames();
+            case ITEM_STACK -> ALL_ITEM_NAMES.get();
             case TEAM_COLOR -> VALID_COLORS;
             case SCOREBOARD_SLOT -> VALID_SCOREBOARD_SLOTS;
             case RESOURCE -> handleResource(context, ((ResourceProperties) node.getProperties()).getRegistryKey(), false);
@@ -322,7 +356,7 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
         return switch (resource.asString()) {
             case "minecraft:attribute" -> ATTRIBUTES;
             case "minecraft:enchantment" -> context.getEnchantments();
-            case "minecraft:entity_type" -> context.getEntityTypes();
+            case "minecraft:entity_type" -> ALL_ENTITY_TYPES.get();
             case "minecraft:mob_effect" -> ALL_EFFECT_IDENTIFIERS;
             case "minecraft:worldgen/biome" -> tags ? context.getBiomesWithTags() : context.getBiomes();
             default -> CommandParam.STRING;
@@ -344,20 +378,61 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
     }
 
     /**
+     * Cache key for enums built from a value array. Arrays are compared by identity: every cached array is either
+     * process-static or memoised for the lifetime of one {@link CommandBuilderContext}, so identity implies equal
+     * content and lookups stay O(1) regardless of array length.
+     */
+    record EnumKey(String name, String[] values) {
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof EnumKey k && k.values == values && k.name.equals(name);
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * name.hashCode() + System.identityHashCode(values);
+        }
+
+        @Override
+        public String toString() {
+            return "EnumKey[name=" + name + ", values=String[" + values.length + "]]";
+        }
+    }
+
+    /**
      * Stores command completions so we don't have to rebuild the same values multiple times.
+     * One instance is created per {@link ClientboundCommandsPacket} translation.
      */
     @MonotonicNonNull
-    private static class CommandBuilderContext {
+    static class CommandBuilderContext {
         private final GeyserSession session;
+        /**
+         * Enums built from session-dependent arrays (enchantments, biomes, levels); lifetime = one packet translation.
+         */
+        private final Map<EnumKey, CommandEnumData> packetEnums = new HashMap<>();
         private Object biomesWithTags;
         private Object biomesNoTags;
         private String[] enchantments;
-        private String[] entityTypes;
-        private String[] itemNames;
         private CommandEnumData teams;
 
         CommandBuilderContext(GeyserSession session) {
             this.session = session;
+        }
+
+        /**
+         * Returns the (shared, immutable) enum for the given name and values. Process-static arrays are cached for the
+         * JVM lifetime; any other array is cached for the lifetime of this context. The returned enum's value map is
+         * unmodifiable and preserves array order.
+         */
+        CommandEnumData enumFor(String name, String[] names) {
+            Map<EnumKey, CommandEnumData> cache = STATIC_ARRAYS.contains(names) ? STATIC_ENUMS : packetEnums;
+            return cache.computeIfAbsent(new EnumKey(name, names), k -> {
+                LinkedHashMap<String, Set<CommandEnumConstraint>> map = new LinkedHashMap<>(k.values().length * 4 / 3 + 1);
+                for (String s : k.values()) {
+                    map.put(s, Set.of());
+                }
+                return new CommandEnumData(k.name(), Collections.unmodifiableMap(map), false);
+            });
         }
 
         private Object getBiomes() {
@@ -383,20 +458,6 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
                 return enchantments;
             }
             return (enchantments = session.getRegistryCache().registry(JavaRegistries.ENCHANTMENT).keys().stream().map(Key::asString).toArray(String[]::new));
-        }
-
-        private String[] getEntityTypes() {
-            if (entityTypes != null) {
-                return entityTypes;
-            }
-            return (entityTypes = Registries.JAVA_ENTITY_IDENTIFIERS.get().keySet().toArray(new String[0]));
-        }
-
-        public String[] getItemNames() {
-            if (itemNames != null) {
-                return itemNames;
-            }
-            return (itemNames = Registries.JAVA_ITEM_IDENTIFIERS.get().keySet().toArray(new String[0]));
         }
 
         private CommandEnumData getTeams() {
@@ -495,13 +556,9 @@ public class JavaCommandsTranslator extends PacketTranslator<ClientboundCommands
                     if (mappedType instanceof CommandEnumData) {
                         // Likely to specify isSoft, to be possibly updated later.
                         enumData = (CommandEnumData) mappedType;
-                    } else if (mappedType instanceof String[]) {
-                        LinkedHashMap<String, Set<CommandEnumConstraint>> map = new LinkedHashMap<>();
-                        for (String s : (String[]) mappedType) {
-                            map.put(s, Set.of());
-                        }
-
-                        enumData = new CommandEnumData(getEnumDataName(paramNode).toLowerCase(Locale.ROOT), map, false);
+                    } else if (mappedType instanceof String[] names) {
+                        // Shared instance; never mutate (its value map is unmodifiable)
+                        enumData = context.enumFor(getEnumDataName(paramNode).toLowerCase(Locale.ROOT), names);
                     } else {
                         type = (CommandParam) mappedType;
                         // Bedrock throws a fit if an optional message comes after a string or target

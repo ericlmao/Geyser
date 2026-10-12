@@ -28,6 +28,7 @@ package org.geysermc.geyser.util;
 import org.geysermc.mcprotocollib.protocol.data.game.statistic.StatisticFormat;
 
 import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
 import java.text.NumberFormat;
 import java.util.EnumMap;
 import java.util.Locale;
@@ -37,20 +38,22 @@ import java.util.function.IntFunction;
 public final class StatisticFormatters {
 
     private static final Map<StatisticFormat, IntFunction<String>> FORMATTERS = new EnumMap<>(StatisticFormat.class);
-    private static final DecimalFormat FORMAT = new DecimalFormat("###,###,##0.00");
+    // DecimalFormat is not thread-safe; Locale.US matches INTEGER below
+    private static final ThreadLocal<DecimalFormat> FORMAT = ThreadLocal.withInitial(
+        () -> new DecimalFormat("###,###,##0.00", DecimalFormatSymbols.getInstance(Locale.US)));
 
     public static final IntFunction<String> INTEGER = NumberFormat.getIntegerInstance(Locale.US)::format;
 
     static {
         FORMATTERS.put(StatisticFormat.INTEGER, INTEGER);
-        FORMATTERS.put(StatisticFormat.TENTHS, value -> FORMAT.format(value / 10d));
+        FORMATTERS.put(StatisticFormat.TENTHS, value -> FORMAT.get().format(value / 10d));
         FORMATTERS.put(StatisticFormat.DISTANCE, centimeter -> {
             double meter = centimeter / 100d;
             double kilometer = meter / 1000d;
             if (kilometer > 0.5) {
-                return FORMAT.format(kilometer) + " km";
+                return FORMAT.get().format(kilometer) + " km";
             } else if (meter > 0.5) {
-                return FORMAT.format(meter) + " m";
+                return FORMAT.get().format(meter) + " m";
             } else {
                 return centimeter + " cm";
             }
@@ -62,15 +65,15 @@ public final class StatisticFormatters {
             double days = hours / 24d;
             double years = days / 365d;
             if (years > 0.5) {
-                return FORMAT.format(years) + " y";
+                return FORMAT.get().format(years) + " y";
             } else if (days > 0.5) {
-                return FORMAT.format(days) + " d";
+                return FORMAT.get().format(days) + " d";
             } else if (hours > 0.5) {
-                return FORMAT.format(hours) + " h";
+                return FORMAT.get().format(hours) + " h";
             } else if (minutes > 0.5) {
-                return FORMAT.format(minutes) + " m";
+                return FORMAT.get().format(minutes) + " m";
             } else {
-                return FORMAT.format(seconds) + " s";
+                return FORMAT.get().format(seconds) + " s";
             }
         });
     }

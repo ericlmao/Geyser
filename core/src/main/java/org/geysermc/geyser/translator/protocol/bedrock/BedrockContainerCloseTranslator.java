@@ -28,6 +28,7 @@ package org.geysermc.geyser.translator.protocol.bedrock;
 import java.util.concurrent.TimeUnit;
 import org.cloudburstmc.protocol.bedrock.packet.ContainerClosePacket;
 import org.geysermc.geyser.GeyserImpl;
+import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.inventory.Inventory;
 import org.geysermc.geyser.inventory.InventoryHolder;
 import org.geysermc.geyser.session.GeyserSession;
@@ -41,7 +42,10 @@ public class BedrockContainerCloseTranslator extends PacketTranslator<ContainerC
 
     @Override
     public void translate(GeyserSession session, ContainerClosePacket packet) {
-        GeyserImpl.getInstance().getLogger().debug(session, packet.toString());
+        GeyserLogger logger = session.getGeyser().getLogger();
+        if (logger.isDebug()) {
+            logger.debug(session, packet.toString());
+        }
         byte bedrockId = packet.getId();
 
         //Client wants close confirmation
@@ -70,7 +74,9 @@ public class BedrockContainerCloseTranslator extends PacketTranslator<ContainerC
                     return;
                 } else {
                     GeyserImpl.getInstance().getLogger().warning(session.bedrockUsername() + " exceeded 7 attempts to open a virtual inventory!");
-                    GeyserImpl.getInstance().getLogger().debug(session, packet + " " + holder.inventory().getClass().getSimpleName());
+                    if (logger.isDebug()) {
+                        logger.debug(session, packet + " " + holder.inventory().getClass().getSimpleName());
+                    }
 
                     // Prevent inventory deadlocks by letting the code below close the inventory
                     bedrockId = (byte) holder.bedrockId();

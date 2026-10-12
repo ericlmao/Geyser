@@ -61,6 +61,21 @@ public final class SoundUtils {
     }
 
     /**
+     * Maps a Bedrock level event name to a level event, null if one
+     * does not exist.
+     *
+     * @param levelEvent the exact {@link LevelEvent} constant name
+     * @return a level event from the given name
+     */
+    public static @Nullable LevelEvent toLevelEvent(String levelEvent) {
+        try {
+            return LevelEvent.valueOf(levelEvent);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    /**
      * Translates a Java Custom or Builtin Sound to its Bedrock equivalent
      *
      * @param javaIdentifier the sound to translate
@@ -119,19 +134,23 @@ public final class SoundUtils {
         }
 
         if (soundMapping.levelEvent()) {
+            LevelEvent levelEventType = soundMapping.levelEventType();
+            if (levelEventType == null) {
+                session.getGeyser().getLogger().debug("[Builtin] Level event mapping '" + soundMapping.bedrock() + "' for '" + soundIdentifier
+                    + "' is not a valid LevelEvent.");
+                return;
+            }
             LevelEventPacket levelEventPacket = new LevelEventPacket();
             levelEventPacket.setPosition(position);
             levelEventPacket.setData(0);
-            levelEventPacket.setType(LevelEvent.valueOf(soundMapping.bedrock()));
+            levelEventPacket.setType(levelEventType);
             session.sendUpstreamPacket(levelEventPacket);
             return;
         }
 
         LevelSoundEventPacket soundPacket = new LevelSoundEventPacket();
-        SoundEvent sound = SoundUtils.toSoundEvent(soundMapping.bedrock());
-        if (sound == null) {
-            sound = SoundUtils.toSoundEvent(soundIdentifier);
-        }
+        // Resolved at registry load: the Bedrock mapping first, then the Java sound name
+        SoundEvent sound = soundMapping.soundEvent();
         if (sound == null) {
             session.getGeyser().getLogger().debug("[Builtin] Sound for original '" + soundIdentifier + "' to mappings '" + soundMapping.bedrock()
                 + "' was not a playable level sound, or has yet to be mapped to an enum in SoundEvent.");

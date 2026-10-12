@@ -32,6 +32,8 @@ import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.ints.IntImmutableList;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.ints.IntLists;
+import it.unimi.dsi.fastutil.objects.Object2ObjectMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectMaps;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import org.cloudburstmc.math.vector.Vector3i;
 import org.cloudburstmc.nbt.NBTOutputStream;
@@ -296,8 +298,8 @@ public class JavaLevelChunkWithLightTranslator extends PacketTranslator<Clientbo
                         BlockDefinition blockDefinition = SkullBlockEntityTranslator.translateSkull(session, tag, Vector3i.from(x + chunkBlockX, y, z + chunkBlockZ), blockState);
                         if (blockDefinition != null) {
                             int bedrockSectionY = (y >> 4) - (bedrockDimension.minY() >> 4);
-                            int subChunkIndex = (y >> 4) + (bedrockDimension.minY() >> 4);
-                            if (0 <= bedrockSectionY && bedrockSectionY < maxBedrockSectionY) {
+                            int subChunkIndex = y >> 4; // Absolute section index, matching the main section loop
+                            if (0 <= bedrockSectionY && bedrockSectionY <= maxBedrockSectionY) {
                                 // Custom skull is in a section accepted by Bedrock
                                 GeyserChunkSection bedrockSection = sections[bedrockSectionY];
                                 IntList palette = bedrockSection.getBlockStorageArray()[0].getPalette();
@@ -391,12 +393,17 @@ public class JavaLevelChunkWithLightTranslator extends PacketTranslator<Clientbo
             }
         }
 
-        for (Map.Entry<Vector3i, ItemFrameEntity> entry : session.getItemFrameCache().entrySet()) {
-            Vector3i position = entry.getKey();
-            if ((position.getX() >> 4) == packet.getX() && (position.getZ() >> 4) == packet.getZ()) {
-                // Update this item frame so it doesn't get lost in the abyss
-                //TODO optimize
-                entry.getValue().updateBlock(true);
+        Object2ObjectMap<Vector3i, ItemFrameEntity> itemFrames = session.getItemFrameCache();
+        if (!itemFrames.isEmpty()) {
+            int chunkX = packet.getX();
+            int chunkZ = packet.getZ();
+            // The cache is an Object2ObjectOpenHashMap; fastIterable avoids an Entry allocation per frame. Do not mutate the map in this loop.
+            for (Map.Entry<Vector3i, ItemFrameEntity> entry : Object2ObjectMaps.fastIterable(itemFrames)) {
+                Vector3i position = entry.getKey();
+                if ((position.getX() >> 4) == chunkX && (position.getZ() >> 4) == chunkZ) {
+                    // Update this item frame so it doesn't get lost in the abyss
+                    entry.getValue().updateBlock(true);
+                }
             }
         }
     }

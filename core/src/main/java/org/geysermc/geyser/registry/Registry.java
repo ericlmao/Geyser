@@ -57,7 +57,7 @@ import org.geysermc.geyser.registry.loader.RegistryLoader;
  * however it demonstrates a fairly basic use case of how this system works. Typically
  * though, the first parameter would be a location of some sort, such as a file path
  * where the loader will load the mappings from. The NBT registry is a good reference
- * point for something both simple and practical. See {@link Registries#BIOMES_NBT} and
+ * point for something both simple and practical. See {@link Registries#BEDROCK_ENTITY_IDENTIFIERS} and
  * {@link org.geysermc.geyser.registry.loader.NbtRegistryLoader}.
  *
  * @param <M> the value being held by the registry

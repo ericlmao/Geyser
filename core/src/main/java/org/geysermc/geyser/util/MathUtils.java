@@ -28,8 +28,18 @@ package org.geysermc.geyser.util;
 import org.cloudburstmc.math.TrigMath;
 import org.cloudburstmc.math.vector.Vector3f;
 
+import java.text.DecimalFormat;
+import java.text.DecimalFormatSymbols;
+import java.util.Locale;
+
 public class MathUtils {
     public static final double SQRT_OF_TWO = Math.sqrt(2);
+    /**
+     * DecimalFormat is not thread-safe, so each thread gets its own instance. Locale.ROOT keeps the output
+     * independent of the JVM default locale (always <code>.</code> as the decimal separator).
+     */
+    private static final ThreadLocal<DecimalFormat> ATTRIBUTE_FORMAT = ThreadLocal.withInitial(
+        () -> new DecimalFormat("0.#####", DecimalFormatSymbols.getInstance(Locale.ROOT)));
 
     public static Vector3f xYRot(Vector3f velocity, float pitch, float yaw) {
         float pitchCos = TrigMath.cos(pitch);
@@ -214,5 +224,30 @@ public class MathUtils {
      */
     public static long chunkPositionToLong(int x, int z) {
         return ((x & 0xFFFFFFFFL) << 32L) | (z & 0xFFFFFFFFL);
+    }
+
+    /**
+     * Rounds to 5 decimal places (half-even), i.e. the value {@code DecimalFormat("#.#####")} would print.
+     * Allocation-free and thread-safe. Non-finite values are returned unchanged.
+     *
+     * @param value the value to round
+     * @return the value rounded to 5 decimal places
+     */
+    public static double roundToFiveDecimals(double value) {
+        if (!Double.isFinite(value)) {
+            return value;
+        }
+        return Math.rint(value * 100_000.0) / 100_000.0;
+    }
+
+    /**
+     * Formats an attribute modifier amount for item lore with at most 5 decimals and no grouping,
+     * e.g. <code>1.5</code> or <code>-2</code>. Thread-safe and independent of the JVM default locale.
+     *
+     * @param amount the amount to format
+     * @return the formatted amount
+     */
+    public static String formatAttributeAmount(double amount) {
+        return ATTRIBUTE_FORMAT.get().format(amount);
     }
 }

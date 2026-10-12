@@ -746,8 +746,23 @@ public class ItemRegistryPopulator {
                     .build(), itemData.getNetId(), itemData.getGroupId()));
             }
 
+            // Index order == ItemMappings#items order, so "first match wins" in ItemMappings#getMapping(ItemData) is preserved
+            Int2ObjectMap<List<ItemMapping>> mappingsByBedrockRuntimeId = new Int2ObjectOpenHashMap<>();
+            for (ItemMapping mapping : mappings) {
+                if (mapping == ItemMapping.AIR) {
+                    continue;
+                }
+                mappingsByBedrockRuntimeId.computeIfAbsent(mapping.getBedrockDefinition().getRuntimeId(), k -> new ObjectArrayList<>(2)).add(mapping);
+            }
+
+            Map<String, ItemDefinition> definitionsByIdentifier = new Object2ObjectOpenHashMap<>(registry.size());
+            for (ItemDefinition definition : registry.values()) {
+                definitionsByIdentifier.putIfAbsent(definition.getIdentifier(), definition);
+            }
+
             ItemMappings itemMappings = ItemMappings.builder()
                     .items(mappings.toArray(new ItemMapping[0]))
+                    .mappingsByBedrockRuntimeId(mappingsByBedrockRuntimeId)
                     .zeroBlockDefinitionRuntimeId(mappings.stream()
                         .filter(entry -> entry.isBlock() && entry.getBedrockBlockDefinition().getRuntimeId() == 0)
                         .map(itemMapping -> itemMapping.getBedrockDefinition().getRuntimeId())
@@ -755,6 +770,7 @@ public class ItemRegistryPopulator {
                     .creativeItems(creativeItems)
                     .creativeItemGroups(creativeItemGroups)
                     .itemDefinitions(registry)
+                    .definitionsByIdentifier(definitionsByIdentifier)
                     .storedItems(new StoredItemMappings(javaItemToMapping))
                     .javaOnlyItems(javaOnlyItems)
                     .buckets(buckets)
