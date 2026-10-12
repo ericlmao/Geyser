@@ -1,0 +1,1171 @@
+/*
+ * Copyright 2022 CloudburstMC
+ *
+ * CloudburstMC licenses this file to you under the Apache License,
+ * version 2.0 (the "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at:
+ *
+ *   https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.cloudburstmc.netty.handler.codec.raknet.common;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.channel.*;
+import io.netty.util.ReferenceCountUtil;
+import io.netty.util.collection.IntObjectHashMap;
+import io.netty.util.collection.IntObjectMap;
+import io.netty.util.concurrent.ScheduledFuture;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.cloudburstmc.netty.channel.raknet.*;
+import org.cloudburstmc.netty.channel.raknet.config.RakChannelMetrics;
+import org.cloudburstmc.netty.channel.raknet.config.RakChannelOption;
+import org.cloudburstmc.netty.channel.raknet.packet.EncapsulatedPacket;
+import org.cloudburstmc.netty.channel.raknet.packet.RakDatagramPacket;
+import org.cloudburstmc.netty.channel.raknet.packet.RakMessage;
+import org.cloudburstmc.netty.util.*;
+
+import java.net.Inet6Address;
+import java.net.InetSocketAddress;
+import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.Queue;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.ObjIntConsumer;
+
+import static org.cloudburstmc.netty.channel.raknet.RakConstants.*;
+
+/**
+ * Patched by Geyser (see patches/README.md), derived from netty-transport-raknet 2.0.0.CR5-20261009.162522-2:
+ * <ul>
+ *     <li>the unsent queue limit ({@link RakChannelOption#RAK_MAX_QUEUED_BYTES}) is enforced when a message is
+ *     queued, not only on the next tick;</li>
+ *     <li>a session stuck in {@link RakState#DISCONNECTING} is closed after the session timeout;</li>
+ *     <li>closing is idempotent and effective in every state;</li>
+ *     <li>outstanding bytes (unsent plus unacknowledged) and receive activity are published for other threads.</li>
+ * </ul>
+ */
+public class RakSessionCodec extends ChannelDuplexHandler {
+    private static final InternalLogger log = InternalLoggerFactory.getInstance(RakSessionCodec.class);
+    public static final String NAME = "rak-session-codec";
+    private static final ChannelException QUEUE_TOO_LONG_EXCEPTION = new ChannelException("RakNet session is closing: outbound queue limit exceeded");
+
+    static {
+        QUEUE_TOO_LONG_EXCEPTION.setStackTrace(new StackTraceElement[0]);
+    }
+    // How far reliable and ordering indices may run ahead of the read index: the Bedrock client's reliable limit.
+    private static final int MAX_RECEIVE_GAP = 32768;
+    // Charged per queued ordered message on top of its payload.
+    private static final int ORDERING_ENTRY_OVERHEAD = 2048;
+
+    private final RakChannel channel;
+    private ScheduledFuture<?> tickFuture;
+
+    private volatile RakState state;
+
+    private volatile long lastTouched = System.currentTimeMillis();
+    private volatile long lastFlush;
+
+    // Reliability, Ordering, Sequencing and datagram indexes
+    private RakSlidingWindow slidingWindow;
+    private int splitIndex;
+    private int datagramReadIndex;
+    private int datagramWriteIndex;
+    private int reliabilityReadIndex;
+    private int reliabilityWriteIndex;
+    private int[] orderReadIndex;
+    private int[] orderWriteIndex;
+
+    private RoundRobinArray<SplitPacketHelper> splitPackets;
+    private BitQueue reliableDatagramQueue;
+    // Sent reliable messages from reliableWindowStart on, true until acknowledged
+    private BitQueue reliableWindow;
+    private int reliableWindowStart;
+    // Unacknowledged part counts of reliable split messages in flight, by split ID
+    private IntObjectMap<int[]> splitsInFlight;
+
+    private FastBinaryMinHeap<EncapsulatedPacket> outgoingPackets;
+    private long[] outgoingPacketNextWeights;
+    private FastBinaryMinHeap<EncapsulatedPacket>[] orderingHeaps;
+    private long currentPingTime = -1;
+    private long lastPingTime = -1;
+    private long lastPongTime = -1;
+    private NavigableMap<Integer, RakDatagramPacket> sentDatagrams;
+    private Queue<IntRange> incomingAcks;
+    private Queue<IntRange> incomingNaks;
+    private Queue<IntRange> outgoingAcks;
+    private Queue<IntRange> outgoingNaks;
+    private long lastMinWeight;
+
+    private int queuedBytes = 0;
+    // Published for other threads; see updateOutstanding()
+    private volatile long outstandingBytes;
+    private boolean closeRequested;
+    private long disconnectStartedAt;
+    // Payload bytes retained by inbound split reassembly and ordered-reorder buffering respectively.
+    private long splitQueuedBytes = 0;
+    private long orderingQueuedBytes = 0;
+
+    public RakSessionCodec(RakChannel channel) {
+        this.channel = channel;
+        this.setState(RakState.UNCONNECTED);
+    }
+
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) throws Exception {
+        this.setState(RakState.CONNECTED);
+        int mtu = this.getMtu();
+
+        this.slidingWindow = new RakSlidingWindow(mtu);
+
+        this.outgoingPacketNextWeights = new long[4];
+        this.initHeapWeights();
+
+        int maxChannels = this.channel.config().getOption(RakChannelOption.RAK_ORDERING_CHANNELS);
+        this.orderReadIndex = new int[maxChannels];
+        this.orderWriteIndex = new int[maxChannels];
+
+        // Noinspection unchecked
+        this.orderingHeaps = new FastBinaryMinHeap[maxChannels];
+        for (int i = 0; i < maxChannels; i++) {
+            orderingHeaps[i] = new FastBinaryMinHeap<>(64);
+        }
+
+        this.outgoingPackets = new FastBinaryMinHeap<>(8);
+        this.sentDatagrams = new TreeMap<>();
+
+        this.incomingAcks = new ArrayDeque<>();
+        this.incomingNaks = new ArrayDeque<>();
+        this.outgoingAcks = new ArrayDeque<>();
+        this.outgoingNaks = new ArrayDeque<>();
+
+        this.reliableDatagramQueue = new BitQueue(512);
+        this.reliableWindow = new BitQueue(RELIABLE_WINDOW_SIZE * 2);
+        this.splitsInFlight = new IntObjectHashMap<>();
+        this.splitPackets = new RoundRobinArray<>(256);
+
+        // After session is fully initialized, start ticking.
+        boolean autoFlush = this.channel.config().isAutoFlush();
+        // Make sure there happens at least one flush per 10ms to respect standard RakNet behavior
+        int flushInterval = autoFlush ? this.channel.config().getFlushInterval() : 10;
+        this.tickFuture = ctx.channel().eventLoop().scheduleAtFixedRate(this::tryTick, 0, flushInterval, TimeUnit.MILLISECONDS);
+
+        ctx.fireChannelActive(); // fire channel active on rakPipeline()
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+        super.channelInactive(ctx);
+        if (this.state == RakState.DISCONNECTED && this.tickFuture == null) {
+            // Already deinitialized
+            return;
+        }
+        this.setState(RakState.DISCONNECTED);
+        this.tickFuture.cancel(false);
+        this.tickFuture = null;
+
+        // Perform resource clean up.
+        for (SplitPacketHelper helper : this.splitPackets) {
+            if (helper != null) {
+                helper.release();
+            }
+        }
+        this.splitPackets = null;
+
+        for (RakDatagramPacket packet : this.sentDatagrams.values()) {
+            packet.release();
+        }
+        this.sentDatagrams = null;
+
+        FastBinaryMinHeap<EncapsulatedPacket>[] orderingHeaps = this.orderingHeaps;
+        this.orderingHeaps = null;
+        if (orderingHeaps != null) {
+            for (FastBinaryMinHeap<EncapsulatedPacket> orderingHeap : orderingHeaps) {
+                EncapsulatedPacket packet;
+                while ((packet = orderingHeap.poll()) != null) {
+                    packet.release();
+                }
+                orderingHeap.release();
+            }
+        }
+
+        FastBinaryMinHeap<EncapsulatedPacket> outgoingPackets = this.outgoingPackets;
+        this.outgoingPackets = null;
+        if (outgoingPackets != null) {
+            EncapsulatedPacket packet;
+            while ((packet = outgoingPackets.poll()) != null) {
+                packet.release();
+            }
+            outgoingPackets.release();
+        }
+
+        this.queuedBytes = 0;
+        this.splitQueuedBytes = 0;
+        this.orderingQueuedBytes = 0;
+        RakOutboundBudget.adjustTotal(-this.outstandingBytes);
+        this.outstandingBytes = 0;
+
+        if (log.isTraceEnabled()) {
+            log.trace("RakNet Session ({} => {}) closed!", this.channel.localAddress(), this.getRemoteAddress());
+        }
+    }
+
+    private void initHeapWeights() {
+        for (int priorityLevel = 0; priorityLevel < 4; priorityLevel++) {
+            this.outgoingPacketNextWeights[priorityLevel] = (1 << priorityLevel) * priorityLevel + priorityLevel;
+        }
+    }
+
+    @Override
+    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+        if (!this.channel.parent().eventLoop().inEventLoop()) {
+            // Make sure this runs on correct thread
+            log.error("Tried to write packet from wrong thread: {}", Thread.currentThread().getName(), new Throwable());
+            final Object finalMsg = msg;
+            this.channel.parent().eventLoop().execute(() -> this.write(ctx, finalMsg, promise));
+            return;
+        }
+        if (msg instanceof ByteBuf) {
+            msg = new RakMessage((ByteBuf) msg);
+        } else if (!(msg instanceof RakMessage)) {
+            throw new IllegalArgumentException("Message must be a ByteBuf or RakMessage");
+        }
+
+        try {
+            if (this.send(ctx, (RakMessage) msg)) {
+                promise.setSuccess(null);
+            } else {
+                promise.tryFailure(QUEUE_TOO_LONG_EXCEPTION);
+            }
+        } finally {
+            ReferenceCountUtil.release(msg);
+        }
+    }
+
+    @Override
+    public void flush(ChannelHandlerContext ctx) throws Exception {
+        if (!this.channel.config().isAutoFlush()) {
+            this.internalFlush(ctx);
+        }
+    }
+
+    @Override
+    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        try {
+            if (!(msg instanceof RakDatagramPacket)) {
+                // We don't want to let anything through that isn't RakNet related.
+                return;
+            }
+            RakDatagramPacket packet = (RakDatagramPacket) msg;
+            if (this.state == RakState.UNCONNECTED) {
+                log.debug("{} received message from inactive channel: {}", this.getRemoteAddress(), packet);
+            } else {
+                this.handleDatagram(ctx, packet);
+            }
+        } finally {
+            ReferenceCountUtil.release(msg);
+        }
+    }
+
+    @Override
+    public void disconnect(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+        ChannelFuture disconnectFuture = this.disconnect0(RakDisconnectReason.DISCONNECTED, false);
+        if (disconnectFuture.isVoid()) {
+            // Already disconnecting or closed, so complete once the close lands
+            disconnectFuture = this.channel.closeFuture();
+        }
+        disconnectFuture.addListener(future -> {
+            if (future.cause() == null) {
+                promise.trySuccess();
+            } else {
+                promise.tryFailure(future.cause());
+            }
+        });
+    }
+
+    /**
+     * @return {@code false} if the message was not queued because the session is closing after exceeding its limits
+     */
+    private boolean send(ChannelHandlerContext ctx, RakMessage message) {
+        if (this.state == RakState.UNCONNECTED) {
+            throw new IllegalStateException("Can not send RakMessage to inactive channel");
+        }
+
+        if (message.content().getUnsignedByte(message.content().readerIndex()) == 0xc0) {
+            throw new IllegalArgumentException();
+        }
+
+        if (message.priority() != RakPriority.IMMEDIATE) {
+            int maxQueuedBytes = this.channel.config().getOption(RakChannelOption.RAK_MAX_QUEUED_BYTES);
+            int size = message.content().readableBytes();
+            if (maxQueuedBytes > 0 && this.queuedBytes > 0 && (long) this.queuedBytes + size > maxQueuedBytes) {
+                // Checked here as well as on tick, so a burst cannot queue far past the limit before the next tick.
+                // Checked before createEncapsulated, so a refused message takes no split ID or ordering index.
+                // close() does not allocate, unlike a disconnect notification.
+                this.close(RakDisconnectReason.QUEUE_TOO_LONG);
+                return false;
+            }
+        }
+
+        EncapsulatedPacket[] packets = this.createEncapsulated(message);
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.encapsulatedOut(1);
+        }
+        if (message.priority() == RakPriority.IMMEDIATE) {
+            this.sendImmediate(ctx, packets);
+            this.updateOutstanding();
+            return true;
+        }
+
+        long weight = this.getNextWeight(message.priority());
+        if (packets.length == 1) {
+            this.outgoingPackets.insert(weight, packets[0]);
+            this.queuedBytes += packets[0].getBuffer().readableBytes();
+        } else {
+            this.outgoingPackets.insertSeries(weight, packets);
+            for (EncapsulatedPacket packet : packets) {
+                this.queuedBytes += packet.getBuffer().readableBytes();
+            }
+        }
+        this.updateOutstanding();
+        return true;
+    }
+
+    /**
+     * Publishes the bytes this session retains for sending (unsent plus sent reliably but unacknowledged) and keeps
+     * the shared {@link RakOutboundBudget} total in sync. Runs on the parent event loop.
+     */
+    private void updateOutstanding() {
+        if (this.state == RakState.DISCONNECTED) {
+            return;
+        }
+        long outstanding = (long) this.queuedBytes + (this.slidingWindow == null ? 0 : this.slidingWindow.getUnackedBytes());
+        long previous = this.outstandingBytes;
+        if (outstanding != previous) {
+            this.outstandingBytes = outstanding;
+            RakOutboundBudget.adjustTotal(outstanding - previous);
+        }
+    }
+
+    /**
+     * @return bytes retained for sending: unsent plus sent reliably but not yet acknowledged. Safe from any thread.
+     */
+    public long getOutstandingBytes() {
+        return this.outstandingBytes;
+    }
+
+    /**
+     * @return when a datagram was last received, in {@link System#currentTimeMillis()} units. Safe from any thread.
+     */
+    public long getLastTouched() {
+        return this.lastTouched;
+    }
+
+    public RakState getState() {
+        return this.state;
+    }
+
+    private void handleDatagram(ChannelHandlerContext ctx, RakDatagramPacket packet) {
+        this.touch();
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.rakDatagramsIn(1);
+        }
+
+        this.slidingWindow.onPacketReceived(packet.getSendTime());
+
+        int prevSequenceIndex = this.datagramReadIndex;
+        if (prevSequenceIndex <= packet.getSequenceIndex()) {
+            this.datagramReadIndex = packet.getSequenceIndex() + 1;
+        }
+
+        int missedDatagrams = packet.getSequenceIndex() - prevSequenceIndex;
+        if (missedDatagrams > 0) {
+            this.outgoingNaks.offer(new IntRange(packet.getSequenceIndex() - missedDatagrams, packet.getSequenceIndex() - 1));
+        }
+
+        this.outgoingAcks.offer(new IntRange(packet.getSequenceIndex(), packet.getSequenceIndex()));
+
+        for (final EncapsulatedPacket encapsulated : packet.getPackets()) {
+            if (encapsulated.getReliability().isReliable()) {
+                int missed = encapsulated.getReliabilityIndex() - this.reliabilityReadIndex;
+                if (missed >= MAX_RECEIVE_GAP) {
+                    this.disconnect(RakDisconnectReason.BAD_PACKET);
+                    return;
+                } else if (missed > 0) {
+                    if (missed < this.reliableDatagramQueue.size()) {
+                        if (this.reliableDatagramQueue.get(missed)) {
+                            this.reliableDatagramQueue.set(missed, false);
+                        } else {
+                            // Duplicate packet
+                            continue;
+                        }
+                    } else {
+                        int count = (missed - this.reliableDatagramQueue.size());
+                        for (int i = 0; i < count; i++) {
+                            this.reliableDatagramQueue.add(true);
+                        }
+
+                        this.reliableDatagramQueue.add(false);
+                    }
+                } else if (missed == 0) {
+                    this.reliabilityReadIndex++;
+                    if (!this.reliableDatagramQueue.isEmpty()) {
+                        this.reliableDatagramQueue.poll();
+                    }
+                } else {
+                    // Duplicate packet
+                    continue;
+                }
+
+                while (!this.reliableDatagramQueue.isEmpty() && !this.reliableDatagramQueue.peek()) {
+                    this.reliableDatagramQueue.poll();
+                    ++this.reliabilityReadIndex;
+                }
+            }
+
+            if (encapsulated.isSplit()) {
+                final EncapsulatedPacket reassembled = this.getReassembledPacket(encapsulated, ctx.alloc());
+                if (reassembled == null) {
+                    // Not reassembled
+                    continue;
+                }
+                if (metrics != null) {
+                    metrics.encapsulatedIn(1);
+                }
+                try {
+                    this.checkForOrdered(ctx, reassembled);
+                } finally {
+                    reassembled.release();
+                }
+            } else {
+                if (metrics != null) {
+                    metrics.encapsulatedIn(1);
+                }
+                this.checkForOrdered(ctx, encapsulated);
+            }
+        }
+    }
+
+    private void checkForOrdered(ChannelHandlerContext ctx, EncapsulatedPacket packet) {
+        if (packet.getReliability().isOrdered()) {
+            this.onOrderedReceived(ctx, packet);
+        } else {
+            ctx.fireChannelRead(packet.retain());
+        }
+    }
+
+    private void onOrderedReceived(ChannelHandlerContext ctx, EncapsulatedPacket packet) {
+        FastBinaryMinHeap<EncapsulatedPacket> binaryHeap = this.orderingHeaps[packet.getOrderingChannel()];
+        int distance = packet.getOrderingIndex() - this.orderReadIndex[packet.getOrderingChannel()];
+        if (distance >= MAX_RECEIVE_GAP) {
+            this.disconnect(RakDisconnectReason.BAD_PACKET);
+            return;
+        } else if (distance > 0) {
+            // Not next in line so add to queue.
+            binaryHeap.insert(packet.getOrderingIndex(), packet.retain());
+            this.orderingQueuedBytes += packet.getBuffer().readableBytes() + ORDERING_ENTRY_OVERHEAD;
+            return;
+        } else if (distance < 0) {
+            // We already have this
+            return;
+        }
+        this.orderReadIndex[packet.getOrderingChannel()]++;
+
+        // Can be handled
+        ctx.fireChannelRead(packet.retain());
+
+        EncapsulatedPacket queuedPacket;
+        while ((queuedPacket = binaryHeap.peek()) != null) {
+            if (queuedPacket.getOrderingIndex() == this.orderReadIndex[packet.getOrderingChannel()]) {
+                try {
+                    // We got the expected packet
+                    binaryHeap.remove();
+                    this.orderingQueuedBytes -= queuedPacket.getBuffer().readableBytes() + ORDERING_ENTRY_OVERHEAD;
+                    this.orderReadIndex[packet.getOrderingChannel()]++;
+                    ctx.fireChannelRead(queuedPacket.retain());
+                } finally {
+                    queuedPacket.release();
+                }
+            } else {
+                // Found a gap. Wait till we start receive another ordered packet.
+                break;
+            }
+        }
+    }
+
+    private EncapsulatedPacket getReassembledPacket(EncapsulatedPacket splitPacket, ByteBufAllocator alloc) {
+        this.checkForClosed();
+
+        int partId = splitPacket.getPartId();
+        SplitPacketHelper helper = this.splitPackets.get(partId);
+        if (helper != null && !helper.matches(splitPacket)) {
+            // Part IDs are only unique modulo the size of this array, so an unrelated split packet may
+            // hold the slot. Drop the part rather than corrupt a reassembly that is still in progress.
+            if (!helper.expired()) {
+                return null;
+            }
+            helper = null; // Released below when set() overwrites it.
+        }
+
+        if (helper == null) {
+            this.splitPackets.set(partId, helper = new SplitPacketHelper(partId, splitPacket.getPartCount()));
+        }
+
+        // Try reassembling the packet, tracking how many bytes this session now retains for split reassembly.
+        int sizeBefore = helper.getReassembledSize();
+        EncapsulatedPacket result = helper.add(splitPacket, alloc);
+        this.splitQueuedBytes += helper.getReassembledSize() - sizeBefore;
+        if (result != null) {
+            // Packet reassembled. Remove the helper and reclaim the bytes it held.
+            this.splitQueuedBytes -= helper.getReassembledSize();
+            this.splitPackets.remove(partId, helper);
+        }
+
+        return result;
+    }
+
+    /**
+     * Drops split reassemblies that have been waiting too long for their remaining parts. Without this a peer can
+     * hold parts in reassembly indefinitely: {@link SplitPacketHelper#expired()} has otherwise never been called.
+     */
+    private void evictExpiredSplitPackets() {
+        Iterator<SplitPacketHelper> iterator = this.splitPackets.iterator();
+        while (iterator.hasNext()) {
+            SplitPacketHelper helper = iterator.next();
+            if (helper != null && helper.expired()) {
+                this.splitQueuedBytes -= helper.getReassembledSize();
+                iterator.remove();
+            }
+        }
+    }
+
+    private void tryTick() {
+        try {
+            this.onTick();
+        } catch (Throwable t) {
+            log.error("[{}] Error while ticking RakSessionCodec state={} channelActive={}", this.getRemoteAddress(), this.state, this.channel.isActive(), t);
+            this.channel.close();
+        }
+    }
+
+    private void onTick() {
+        long curTime = System.currentTimeMillis();
+
+        if (this.state == RakState.DISCONNECTING && this.disconnectStartedAt > 0
+                && curTime - this.disconnectStartedAt >= this.channel.config().getOption(RakChannelOption.RAK_SESSION_TIMEOUT)) {
+            // The client never acknowledged the disconnect notification; stop waiting for it
+            this.close(RakDisconnectReason.TIMED_OUT);
+            return;
+        }
+
+        int maxQueuedBytes = this.channel.config().getOption(RakChannelOption.RAK_MAX_QUEUED_BYTES);
+
+        if (maxQueuedBytes > 0 && this.queuedBytes > maxQueuedBytes) {
+            this.disconnect(RakDisconnectReason.QUEUE_TOO_LONG);
+            return;
+        }
+
+        // Drop stale incomplete reassemblies before enforcing the inbound split budget, so a peer that
+        // legitimately abandons a split packet does not count against a peer that is deliberately holding one.
+        this.evictExpiredSplitPackets();
+
+        int maxSplitQueuedBytes = this.channel.config().getOption(RakChannelOption.RAK_MAX_SPLIT_QUEUED_BYTES);
+        if (maxSplitQueuedBytes > 0 && this.splitQueuedBytes > maxSplitQueuedBytes) {
+            this.disconnect(RakDisconnectReason.SPLIT_QUEUE_TOO_LONG);
+            return;
+        }
+
+        int maxOrderingQueuedBytes = this.channel.config().getOption(RakChannelOption.RAK_MAX_ORDERING_QUEUED_BYTES);
+        if (maxOrderingQueuedBytes > 0 && this.orderingQueuedBytes > maxOrderingQueuedBytes) {
+            this.disconnect(RakDisconnectReason.ORDERING_QUEUE_TOO_LONG);
+            return;
+        }
+
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.queuedPacketBytes(this.queuedBytes);
+        }
+
+        if (this.state == RakState.UNCONNECTED) {
+            if (this.isTimedOut(curTime)) {
+                this.close(RakDisconnectReason.TIMED_OUT);
+            }
+            return;
+        }
+
+        if (this.isTimedOut(curTime)) {
+            this.disconnect(RakDisconnectReason.TIMED_OUT);
+            return;
+        }
+
+        ChannelHandlerContext ctx = ctx();
+
+        if (this.currentPingTime + 2000L < curTime) {
+            ByteBuf buffer = ctx.alloc().ioBuffer(9);
+            buffer.writeByte(ID_CONNECTED_PING);
+            buffer.writeLong(curTime);
+            this.currentPingTime = curTime;
+            this.write(ctx, new RakMessage(buffer, RakReliability.UNRELIABLE, RakPriority.IMMEDIATE), ctx.voidPromise());
+        }
+
+         this.internalFlush(ctx);
+    }
+
+    private void internalFlush(ChannelHandlerContext ctx) {
+        long curTime = System.currentTimeMillis();
+        if (this.lastFlush == curTime) {
+            return; // do not flush multiple times within one ms
+        }
+        this.lastFlush = curTime;
+
+        this.handleIncomingAcknowledge(ctx, curTime, this.incomingAcks, false);
+        this.handleIncomingAcknowledge(ctx, curTime, this.incomingNaks, true);
+
+        // Send our know outgoing acknowledge packets.
+        int mtuSize = this.getMtu();
+        int ackMtu = mtuSize - RAKNET_DATAGRAM_HEADER_SIZE;
+        int writtenAcks = 0;
+        int writtenNacks = 0;
+
+        // if (this.slidingWindow.shouldSendAcks(curTime)) {
+        while (!this.outgoingAcks.isEmpty()) {
+            ByteBuf buffer = ctx.alloc().ioBuffer(ackMtu);
+            buffer.writeByte(FLAG_VALID | FLAG_ACK);
+            writtenAcks += RakUtils.writeAckEntries(buffer, this.outgoingAcks, ackMtu - 1);
+            ctx.write(buffer);
+            this.slidingWindow.onSendAck();
+        }
+        // }
+
+        while (!this.outgoingNaks.isEmpty()) {
+            ByteBuf buffer = ctx.alloc().ioBuffer(ackMtu);
+            buffer.writeByte(FLAG_VALID | FLAG_NACK);
+            writtenNacks += RakUtils.writeAckEntries(buffer, this.outgoingNaks, ackMtu - 1);
+            ctx.write(buffer);
+        }
+
+        // Send packets that are stale first
+        int resendCount = this.sendStaleDatagrams(ctx, curTime);
+        // Now send usual packets
+        this.sendDatagrams(ctx, curTime, mtuSize);
+        // Finally flush channel
+        ctx.flush();
+        this.updateOutstanding();
+
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.nackOut(writtenNacks);
+            metrics.ackOut(writtenAcks);
+            metrics.rakStaleDatagrams(resendCount);
+        }
+    }
+
+    private void handleIncomingAcknowledge(ChannelHandlerContext ctx, long curTime, Queue<IntRange> queue, boolean nack) {
+        if (queue.isEmpty()) {
+            return;
+        }
+
+//        if (nack) {
+//            this.slidingWindow.onNak();
+//        }
+
+        IntRange range;
+        while ((range = queue.poll()) != null) {
+            if (range.end < range.start || range.end >= this.datagramWriteIndex) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Received {} with out-of-range indices [{}, {}] from {} (write index: {})",
+                            nack ? "NACK" : "ACK", range.start, range.end, this.getRemoteAddress(), this.datagramWriteIndex);
+                }
+                continue;
+            }
+
+            removeAcknowledged(this.sentDatagrams, range.start, range.end, datagram -> {
+                if (nack) {
+                    this.onIncomingNack(ctx, datagram, curTime);
+                } else {
+                    this.onIncomingAck(datagram, curTime);
+                }
+            });
+        }
+    }
+
+    /**
+     * Removes the in-flight datagrams in {@code [start, end]} and passes each to {@code action} in sequence order.
+     */
+    static void removeAcknowledged(NavigableMap<Integer, RakDatagramPacket> sentDatagrams, int start, int end,
+                                   Consumer<RakDatagramPacket> action) {
+        // Polled rather than iterated, as a NACK resends through action, which adds the datagram back under a new index
+        NavigableMap<Integer, RakDatagramPacket> range = sentDatagrams.subMap(start, true, end, true);
+        Map.Entry<Integer, RakDatagramPacket> entry;
+        while ((entry = range.pollFirstEntry()) != null) {
+            action.accept(entry.getValue());
+        }
+    }
+
+    private void onIncomingAck(RakDatagramPacket datagram, long curTime) {
+        try {
+            this.slidingWindow.onAck(curTime, datagram, this.datagramWriteIndex);
+            this.acknowledgeReliable(datagram);
+        } finally {
+            datagram.release();
+        }
+    }
+
+    private void acknowledgeReliable(RakDatagramPacket datagram) {
+        for (EncapsulatedPacket packet : datagram.getPackets()) {
+            if (!packet.getReliability().isReliable()) {
+                continue;
+            }
+            this.reliableWindow.set(packet.getReliabilityIndex() - this.reliableWindowStart, false);
+            if (packet.isSplit()) {
+                int[] unacknowledged = this.splitsInFlight.get(packet.getPartId());
+                if (unacknowledged != null && --unacknowledged[0] == 0) {
+                    this.splitsInFlight.remove(packet.getPartId());
+                }
+            }
+        }
+        while (!this.reliableWindow.isEmpty() && !this.reliableWindow.peek()) {
+            this.reliableWindow.poll();
+            this.reliableWindowStart++;
+        }
+    }
+
+    private void onIncomingNack(ChannelHandlerContext ctx, RakDatagramPacket datagram, long curTime) {
+        if (log.isTraceEnabled()) {
+            log.trace("NAK'ed datagram {} from {}", datagram.getSequenceIndex(), this.getRemoteAddress());
+        }
+
+        this.slidingWindow.onNak(); // TODO: verify this
+        this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+    }
+
+    private int sendStaleDatagrams(ChannelHandlerContext ctx, long curTime) {
+        if (this.sentDatagrams.isEmpty()) {
+            return 0;
+        }
+
+        boolean hasResent = false;
+        int resendCount = 0;
+        int transmissionBandwidth = this.slidingWindow.getRetransmissionBandwidth();
+
+        Map<Integer, RakDatagramPacket> sent = new HashMap<>();
+        Iterator<RakDatagramPacket> iterator = this.sentDatagrams.values().iterator();
+        while (iterator.hasNext()) {
+            RakDatagramPacket datagram = iterator.next();
+            if (datagram.getNextSend() <= curTime) {
+                int size = datagram.getSize();
+                if (transmissionBandwidth < size) {
+                    break;
+                }
+                transmissionBandwidth -= size;
+
+                if (!hasResent) {
+                    hasResent = true;
+                }
+                if (log.isTraceEnabled()) {
+                    log.trace("Stale datagram {} from {}", datagram.getSequenceIndex(), this.getRemoteAddress());
+                }
+                resendCount++;
+                iterator.remove();
+                this.sendDatagram(ctx, datagram, curTime, sent);
+            }
+        }
+        this.sentDatagrams.putAll(sent);
+
+        if (hasResent) {
+            this.slidingWindow.onResend(this.datagramWriteIndex);
+        }
+
+        return resendCount;
+    }
+
+    private void sendDatagrams(ChannelHandlerContext ctx, long curTime, int mtuSize) {
+        if (this.outgoingPackets.isEmpty()) {
+            return;
+        }
+
+        int transmissionBandwidth = this.slidingWindow.getTransmissionBandwidth();
+        RakDatagramPacket datagram = RakDatagramPacket.newInstance();
+        EncapsulatedPacket packet;
+
+        while ((packet = this.outgoingPackets.peek()) != null) {
+            int size = packet.getSize();
+            if (transmissionBandwidth < size) {
+                break;
+            }
+            if (packet.getReliability().isReliable() && this.reliableWindow.size() >= RELIABLE_WINDOW_SIZE) {
+                // The peer would drop it, so wait for acknowledgements
+                break;
+            }
+            if (packet.isSplit() && packet.getReliability().isReliable()
+                    && this.splitsInFlight.size() >= MAXIMUM_SPLITS_IN_FLIGHT
+                    && !this.splitsInFlight.containsKey(packet.getPartId())) {
+                // Likewise for a new split message, so wait for one in flight to complete
+                break;
+            }
+
+            transmissionBandwidth -= size;
+            this.outgoingPackets.remove();
+            this.queuedBytes -= packet.getBuffer().readableBytes();
+
+            // Send full datagram
+            if (!datagram.tryAddPacket(packet, mtuSize)) {
+                this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+
+                datagram = RakDatagramPacket.newInstance();
+                if (!datagram.tryAddPacket(packet, mtuSize)) {
+                    throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() + ", MTU: " + mtuSize + ")");
+                }
+            }
+            this.trackSent(packet);
+        }
+
+        if (!datagram.getPackets().isEmpty()) {
+            this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+        }
+    }
+
+    private void sendImmediate(ChannelHandlerContext ctx, EncapsulatedPacket[] packets) {
+        long curTime = System.currentTimeMillis();
+        for (EncapsulatedPacket packet : packets) {
+            RakDatagramPacket datagram = RakDatagramPacket.newInstance();
+            if (!datagram.tryAddPacket(packet, this.getMtu())) {
+                throw new IllegalArgumentException("Packet too large to fit in MTU (size: " + packet.getSize() + ", MTU: " + this.getMtu() + ")");
+            }
+            // Bypasses the reliable window and split limit, as it bypasses congestion control
+            this.trackSent(packet);
+            this.sendDatagram(ctx, datagram, curTime, this.sentDatagrams);
+        }
+        ctx.flush();
+    }
+
+    // Indices are assigned on send rather than on write, so they go out in order whatever the priority
+    private void trackSent(EncapsulatedPacket packet) {
+        if (!packet.getReliability().isReliable()) {
+            return;
+        }
+        packet.setReliabilityIndex(this.reliabilityWriteIndex++);
+        this.reliableWindow.add(true);
+        if (packet.isSplit() && !this.splitsInFlight.containsKey(packet.getPartId())) {
+            this.splitsInFlight.put(packet.getPartId(), new int[]{packet.getPartCount()});
+        }
+    }
+
+    private void sendDatagram(ChannelHandlerContext ctx, RakDatagramPacket datagram, long time, Map<Integer, RakDatagramPacket> sent) {
+        if (datagram.getPackets().isEmpty()) {
+            throw new IllegalArgumentException("RakNetDatagram with no packets");
+        }
+
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.rakDatagramsOut(1);
+        }
+
+        int oldIndex = datagram.getSequenceIndex();
+        datagram.setSequenceIndex(this.datagramWriteIndex++);
+        // Restamped on resends, as an ACK for the new sequence index can only answer this transmission
+        datagram.setSendTime(time);
+
+        for (EncapsulatedPacket packet : datagram.getPackets()) {
+            // Check if packet is reliable so it can be resent later if a NAK is received.
+            if (packet.getReliability().isReliable()) {
+                datagram.setNextSend(time + this.slidingWindow.getRtoForRetransmission());
+                if (oldIndex == -1) {
+                    this.slidingWindow.onReliableSend(datagram);
+                }
+                sent.put(datagram.getSequenceIndex(), datagram.retain()); // Keep for resending
+                break;
+            }
+        }
+        ctx.write(datagram);
+    }
+
+    private ChannelHandlerContext ctx() {
+        return this.channel.rakPipeline().context(RakSessionCodec.NAME);
+    }
+
+    private EncapsulatedPacket[] createEncapsulated(RakMessage rakMessage) {
+        int maxLength = partSize(this.getMtu());
+
+        ByteBuf[] buffers;
+        int splitId = 0;
+        RakReliability reliability = rakMessage.reliability();
+        ByteBuf buffer = rakMessage.content();
+        int orderingChannel = rakMessage.channel();
+
+        if (buffer.readableBytes() > maxLength) {
+            // Packet requires splitting
+            // Adjust reliability
+            switch (reliability) {
+                case UNRELIABLE:
+                    reliability = RakReliability.RELIABLE;
+                    break;
+                case UNRELIABLE_SEQUENCED:
+                    reliability = RakReliability.RELIABLE_SEQUENCED;
+                    break;
+                case UNRELIABLE_WITH_ACK_RECEIPT:
+                    reliability = RakReliability.RELIABLE_WITH_ACK_RECEIPT;
+                    break;
+            }
+
+            int split = ((buffer.readableBytes() - 1) / maxLength) + 1;
+            if (split > MAXIMUM_SPLIT_COUNT) {
+                // Refused before taking a split ID or ordering index, so the session carries on
+                throw new IllegalArgumentException("Message of " + buffer.readableBytes() + " bytes needs " + split
+                        + " parts, more than the " + MAXIMUM_SPLIT_COUNT + " allowed");
+            }
+            buffer.retain(split);
+
+            buffers = new ByteBuf[split];
+            for (int i = 0; i < split; i++) {
+                buffers[i] = buffer.readSlice(Math.min(maxLength, buffer.readableBytes()));
+            }
+            if (buffer.isReadable()) {
+                throw new IllegalStateException("Buffer still has bytes to read!");
+            }
+
+            // Allocate split ID
+            splitId = this.splitIndex++;
+        } else {
+            buffers = new ByteBuf[]{buffer.readRetainedSlice(buffer.readableBytes())};
+        }
+
+        // Set meta
+        // TODO: sequencing
+        int orderingIndex = 0;
+        if (reliability.isOrdered()) {
+            orderingIndex = this.orderWriteIndex[orderingChannel]++;
+        }
+
+        // Now create the packets.
+        EncapsulatedPacket[] packets = new EncapsulatedPacket[buffers.length];
+        for (int i = 0, parts = buffers.length; i < parts; i++) {
+            EncapsulatedPacket packet = EncapsulatedPacket.newInstance();
+            packet.setBuffer(buffers[i]);
+            packet.setNeedsBAS(true);
+            packet.setOrderingChannel((short) orderingChannel);
+            packet.setOrderingIndex(orderingIndex);
+            // packet.setSequenceIndex(sequencingIndex);
+            packet.setReliability(reliability);
+
+            if (parts > 1) {
+                packet.setSplit(true);
+                packet.setPartIndex(i);
+                packet.setPartCount(parts);
+                packet.setPartId(splitId);
+            }
+
+            packets[i] = packet;
+        }
+        return packets;
+    }
+
+    private long getNextWeight(RakPriority priority) {
+        int priorityLevel = priority.ordinal();
+        long next = this.outgoingPacketNextWeights[priorityLevel];
+
+        if (!this.outgoingPackets.isEmpty()) {
+            if (next >= this.lastMinWeight) {
+                next = this.lastMinWeight + (1L << priorityLevel) * priorityLevel + priorityLevel;
+                this.outgoingPacketNextWeights[priorityLevel] = next + (1L << priorityLevel) * (priorityLevel + 1) + priorityLevel;
+            }
+        } else {
+            this.initHeapWeights();
+        }
+        this.lastMinWeight = next - (1L << priorityLevel) * priorityLevel + priorityLevel;
+        return next;
+    }
+
+    /**
+     * Sends a disconnect notification to the peer, then closes the channel. Fires no {@link RakDisconnectReason},
+     * as the caller already knows why it disconnects. {@link Channel#disconnect()} behaves the same.
+     */
+    public void disconnect() {
+        this.disconnect(RakDisconnectReason.DISCONNECTED, false);
+    }
+
+    /**
+     * Like {@link #disconnect()}, but fires {@code reason} as a user event before closing.
+     */
+    public void disconnect(RakDisconnectReason reason) {
+        this.disconnect(reason, true);
+    }
+
+    private void disconnect(RakDisconnectReason reason, boolean fireEvent) {
+        // Ensure we disconnect on the right thread
+        if (this.channel.parent().eventLoop().inEventLoop()) {
+            this.disconnect0(reason, fireEvent);
+        } else {
+            this.channel.parent().eventLoop().execute(() -> this.disconnect0(reason, fireEvent));
+        }
+    }
+
+    private ChannelPromise disconnect0(RakDisconnectReason reason, boolean fireEvent) {
+        // Disconnecting, or already closed
+        if (this.state != RakState.CONNECTED) {
+            return this.channel.voidPromise();
+        }
+        this.setState(RakState.DISCONNECTING);
+        this.disconnectStartedAt = System.currentTimeMillis();
+
+        if (log.isDebugEnabled()) {
+            log.debug("Disconnecting RakNet Session ({} => {}) due to {}", this.channel.localAddress(), this.getRemoteAddress(), reason);
+        }
+
+        ChannelHandlerContext ctx = this.ctx();
+        ChannelPromise promise = ctx.newPromise();
+        // The channel provided in ChannelFuture is parent channel, but we want RakChannel instead
+        promise.addListener((ChannelFuture future) -> {
+            if (fireEvent) {
+                this.channel.pipeline().fireUserEventTriggered(reason);
+            }
+            this.channel.close();
+        });
+        try {
+            ByteBuf buffer = ctx.alloc().ioBuffer(1);
+            buffer.writeByte(ID_DISCONNECTION_NOTIFICATION);
+            this.write(ctx, new RakMessage(buffer, RakReliability.RELIABLE, RakPriority.IMMEDIATE), promise);
+        } catch (Throwable t) {
+            log.warn("[{}] Failed to send disconnect notification, closing without it", this.getRemoteAddress(), t);
+            // The listener closes on failure too, so a lost notification cannot strand the session in DISCONNECTING
+            promise.tryFailure(t);
+        }
+        return promise;
+    }
+
+    /**
+     * Closes the session without notifying the client. Idempotent: the reason is only reported once, but a repeated
+     * call still closes the channel if it is open, so a session can never be left open after a close was requested.
+     */
+    public void close(RakDisconnectReason reason) {
+        if (this.state == RakState.DISCONNECTED) {
+            return;
+        }
+        this.setState(RakState.DISCONNECTING);
+
+        if (!this.closeRequested) {
+            this.closeRequested = true;
+            if (log.isDebugEnabled()) {
+                log.debug("Closing RakNet Session ({} => {}) due to {}", this.channel.localAddress(), this.getRemoteAddress(), reason);
+            }
+            this.channel.pipeline().fireUserEventTriggered(reason).close();
+        } else if (this.channel.isOpen()) {
+            this.channel.close();
+        }
+    }
+
+    public boolean isClosed() {
+        return this.state == RakState.UNCONNECTED;
+    }
+
+    private void checkForClosed() {
+        if (this.state == RakState.UNCONNECTED) {
+            throw new IllegalStateException("RakSession is closed!");
+        }
+    }
+
+    private void setState(RakState state) {
+        if (this.state == state) {
+            return;
+        }
+        this.state = state;
+
+        RakChannelMetrics metrics = this.getMetrics();
+        if (metrics != null) {
+            metrics.stateChange(state);
+        }
+    }
+
+    public void recalculatePongTime(long pingTime) {
+        if (this.currentPingTime == pingTime) {
+            this.lastPingTime = this.currentPingTime;
+            this.lastPongTime = System.currentTimeMillis();
+        }
+    }
+
+    private void touch() {
+        this.checkForClosed();
+        this.lastTouched = System.currentTimeMillis();
+    }
+
+    public boolean isStale(long curTime) {
+        return curTime - this.lastTouched >= SESSION_STALE_MS;
+    }
+
+    public boolean isStale() {
+        return this.isStale(System.currentTimeMillis());
+    }
+
+    public boolean isTimedOut(long curTime) {
+        return curTime - this.lastTouched >= this.channel.config().getOption(RakChannelOption.RAK_SESSION_TIMEOUT);
+    }
+
+    public boolean isTimedOut() {
+        return this.isTimedOut(System.currentTimeMillis());
+    }
+
+    public long getPing() {
+        return this.lastPongTime - this.lastPingTime;
+    }
+
+    public double getRTT() {
+        return this.slidingWindow.getRTT();
+    }
+
+    public int getMtu() {
+        return this.channel.config().getMtu() - UDP_HEADER_SIZE - (this.getRemoteAddress().getAddress() instanceof Inet6Address ? 40 : 20);
+    }
+
+    // Message bytes one split part carries, at an MTU as getMtu reports it
+    private static int partSize(int mtu) {
+        return mtu - MAXIMUM_ENCAPSULATED_HEADER_SIZE - RAKNET_DATAGRAM_HEADER_SIZE;
+    }
+
+    /**
+     * Largest message the session can write, what {@link RakConstants#MAXIMUM_SPLIT_COUNT} parts carry at its MTU.
+     */
+    public int getMaxMessageSize() {
+        return maxMessageSize(this.getMtu());
+    }
+
+    /**
+     * Largest message a session can write at an MTU less the UDP and IP headers, as {@link #getMtu()} reports it.
+     */
+    public static int maxMessageSize(int mtu) {
+        return MAXIMUM_SPLIT_COUNT * partSize(mtu);
+    }
+
+    public RakChannelMetrics getMetrics() {
+        return this.channel.config().getMetrics();
+    }
+
+    public InetSocketAddress getRemoteAddress() {
+        return (InetSocketAddress) this.channel.remoteAddress();
+    }
+
+    protected Queue<IntRange> getAcknowledgeQueue(boolean nack) {
+        return nack ? this.incomingNaks : this.incomingAcks;
+    }
+
+    public Channel getChannel() {
+        return channel;
+    }
+}

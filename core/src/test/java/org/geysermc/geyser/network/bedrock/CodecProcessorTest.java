@@ -25,10 +25,14 @@
 
 package org.geysermc.geyser.network.bedrock;
 
+import org.cloudburstmc.protocol.bedrock.BedrockServerSession;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockCodec;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockPacketDefinition;
 import org.cloudburstmc.protocol.bedrock.codec.BedrockPacketSerializer;
+import org.cloudburstmc.protocol.bedrock.codec.v2168.Bedrock_v2168;
 import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket;
+import org.cloudburstmc.protocol.bedrock.packet.MovePlayerPacket;
+import org.geysermc.geyser.session.UpstreamSession;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -38,6 +42,12 @@ import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 public class CodecProcessorTest {
 
@@ -73,6 +83,25 @@ public class CodecProcessorTest {
                 checkSerializer(processedCodec, baseCodec, packetClass);
             }
         }
+    }
+
+    @Test
+    public void legacyCodecIsBuiltOnce() {
+        BedrockCodec legacy = CodecProcessor.LEGACY_1_26_40_CODEC;
+        Assertions.assertEquals(Bedrock_v2168.CODEC.getProtocolVersion(), legacy.getProtocolVersion());
+        Assertions.assertNotSame(Bedrock_v2168.CODEC, legacy);
+        Assertions.assertNotSame(Bedrock_v2168.CODEC.getPacketDefinition(MovePlayerPacket.class).getSerializer(),
+            legacy.getPacketDefinition(MovePlayerPacket.class).getSerializer());
+
+        BedrockServerSession bedrockSession = mock(BedrockServerSession.class);
+        UpstreamSession upstream = new UpstreamSession(bedrockSession);
+        CodecProcessor.updateCodec(upstream, "1.26.40");
+        CodecProcessor.updateCodec(upstream, "1.26.43");
+        verify(bedrockSession, times(2)).setCodec(legacy);
+
+        BedrockServerSession current = mock(BedrockServerSession.class);
+        CodecProcessor.updateCodec(new UpstreamSession(current), "1.26.44");
+        verify(current, never()).setCodec(any());
     }
 
     private <T extends BedrockPacket> void checkSerializer(BedrockCodec processed, BedrockCodec base, Class<T> packetClass) {

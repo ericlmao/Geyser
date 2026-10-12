@@ -1,0 +1,4 @@
+# Version of org.cloudburstmc.netty:netty-transport-raknet the classes in src/main/java were derived from.
+# The verifyUpstreamBase task (part of check) fails while it differs from the "network" version in gradle/libs.versions.toml.
+# Change it only after re-deriving the patched classes from the new upstream sources.
+2.0.0.CR5-20261009.162522-2

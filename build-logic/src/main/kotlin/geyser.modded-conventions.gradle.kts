@@ -127,7 +127,14 @@ afterEvaluate {
             and !providedDependencies.contains("${dep.moduleVersion.id.group}:.*")
         ) {
             println("Including dependency via JiJ: ${dep.id}")
-            dependencies.add("include", dep.moduleVersion.id.toString())
+            // Project artifacts (e.g. the patched Cloudburst projects substituted in geyser.base-conventions) must stay project
+            // dependencies: their group:name:version coordinates do not exist in any repository
+            val component = dep.id.componentIdentifier
+            if (component is ProjectComponentIdentifier) {
+                dependencies.add("include", project(component.projectPath))
+            } else {
+                dependencies.add("include", dep.moduleVersion.id.toString())
+            }
         } else {
             println("Not including ${dep.id} for ${project.name}!")
         }

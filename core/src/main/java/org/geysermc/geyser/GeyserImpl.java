@@ -25,6 +25,7 @@
 
 package org.geysermc.geyser;
 
+import org.cloudburstmc.netty.channel.raknet.RakOutboundBudget;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import io.netty.channel.epoll.Epoll;
@@ -85,6 +86,9 @@ import org.geysermc.geyser.level.BedrockDimension;
 import org.geysermc.geyser.level.WorldManager;
 import org.geysermc.geyser.network.RaknetServer;
 import org.geysermc.geyser.network.bedrock.GameProtocol;
+import org.geysermc.geyser.network.bedrock.GeyserOutboundPolicy;
+import org.geysermc.geyser.network.bedrock.OutboundLimits;
+import org.geysermc.geyser.network.bedrock.TransportMonitor;
 import org.geysermc.geyser.network.bedrock.nethernet.NetherNetServer;
 import org.geysermc.geyser.ping.GeyserLegacyPingPassthrough;
 import org.geysermc.geyser.registry.BlockRegistries;
@@ -177,6 +181,11 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
 
     private RaknetServer geyserServer;
     private NetherNetServer netherNetServer;
+    /**
+     * Limits on outbound work for Bedrock connections, and the monitor enforcing them; recreated on each start.
+     */
+    private GeyserOutboundPolicy outboundPolicy;
+    private TransportMonitor transportMonitor;
     private final GeyserBootstrap bootstrap;
 
     private final GeyserEventBus eventBus;
@@ -322,6 +331,12 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         GeyserConfig config = bootstrap.config();
 
         this.scoreboardUpdater = ScoreboardUpdater.init();
+
+        OutboundLimits outboundLimits = OutboundLimits.fromSystemProperties(logger);
+        RakOutboundBudget.configure(outboundLimits.rakMaxOutstandingBytes(), outboundLimits.rakMaxTotalOutstandingBytes(), outboundLimits.rakMaxPendingWrites());
+        this.outboundPolicy = new GeyserOutboundPolicy(outboundLimits, logger);
+        this.transportMonitor = new TransportMonitor(logger, outboundLimits, this.outboundPolicy);
+        this.transportMonitor.start();
 
         SkinProvider.registerCacheImageTask(this);
 
@@ -682,6 +697,7 @@ public class GeyserImpl implements GeyserApi, EventRegistrar {
         runIfNonNull(scoreboardUpdater, ScoreboardUpdater::shutdown);
         runIfNonNull(netherNetServer, NetherNetServer::shutdown);
         runIfNonNull(geyserServer, RaknetServer::shutdown);
+        runIfNonNull(transportMonitor, TransportMonitor::shutdown);
         SkinProvider.shutdown();
         runIfNonNull(skinUploader, FloodgateSkinUploader::close);
         runIfNonNull(newsHandler, NewsHandler::shutdown);

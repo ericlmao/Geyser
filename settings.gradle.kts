@@ -29,6 +29,8 @@ include(":velocity")
 include(":viaproxy")
 include(":common")
 include(":core")
+include(":patched-protocol-connection")
+include(":patched-network-raknet")
 
 // Specify project dirs
 project(":bungeecord").projectDir = file("bootstrap/bungeecord")
@@ -40,6 +42,8 @@ project(":spigot").projectDir = file("bootstrap/spigot")
 project(":standalone").projectDir = file("bootstrap/standalone")
 project(":velocity").projectDir = file("bootstrap/velocity")
 project(":viaproxy").projectDir = file("bootstrap/viaproxy")
+project(":patched-protocol-connection").projectDir = file("patches/protocol-connection")
+project(":patched-network-raknet").projectDir = file("patches/network-raknet")
 
 // Allow to download JVMs for toolchains
 plugins {
