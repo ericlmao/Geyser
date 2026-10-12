@@ -41,6 +41,7 @@ import java.util.Map;
 public class GeyserExtensionManager extends ExtensionManager {
     private final GeyserExtensionLoader extensionLoader = new GeyserExtensionLoader();
     private final Map<String, Extension> extensions = new LinkedHashMap<>();
+    private volatile boolean closed;
 
     public void init() {
         GeyserImpl.getInstance().getLogger().info(GeyserLocale.getLocaleStringLog("geyser.extensions.load.loading"));
@@ -80,6 +81,10 @@ public class GeyserExtensionManager extends ExtensionManager {
     }
 
     public void enableExtension(Extension extension) {
+        if (this.closed) {
+            // The extension classloaders are closed; classes not yet loaded can no longer be resolved
+            throw new IllegalStateException("Cannot enable extension " + extension.name() + " after extensions were shut down");
+        }
         if (!extension.isEnabled()) {
             extension.setEnabled(true);
             GeyserImpl.getInstance().eventBus().register(extension, extension);
@@ -106,6 +111,9 @@ public class GeyserExtensionManager extends ExtensionManager {
         for (Extension extension : this.extensions()) {
             this.disable(extension);
         }
+        // Only reached on shutdown; release the jars so the loaders (and every class they define) can be collected
+        this.closed = true;
+        this.extensionLoader.shutdown();
     }
 
     @NonNull

@@ -35,6 +35,7 @@ import com.velocitypowered.api.proxy.server.ServerPing;
 import com.velocitypowered.api.proxy.server.ServerPing.Version;
 import lombok.AllArgsConstructor;
 import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
+import org.geysermc.geyser.GeyserImpl;
 import org.geysermc.geyser.network.bedrock.GameProtocol;
 import org.geysermc.geyser.ping.GeyserPingInfo;
 import org.geysermc.geyser.ping.IGeyserPingPassthrough;
@@ -42,6 +43,8 @@ import org.geysermc.geyser.ping.IGeyserPingPassthrough;
 import java.net.InetSocketAddress;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @AllArgsConstructor
 public class GeyserVelocityPingPassthrough implements IGeyserPingPassthrough {
@@ -56,7 +59,12 @@ public class GeyserVelocityPingPassthrough implements IGeyserPingPassthrough {
                 .description(server.getConfiguration().getMotd())
                 .onlinePlayers(server.getPlayerCount())
                 .maximumPlayers(server.getConfiguration().getShowMaxPlayers())
-                .version(new Version(GameProtocol.getJavaProtocolVersion(), GameProtocol.getJavaMinecraftVersion())).build())).get();
+                .version(new Version(GameProtocol.getJavaProtocolVersion(), GameProtocol.getJavaMinecraftVersion())).build())).get(100, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            // Don't stall the Bedrock network thread on a slow ProxyPingEvent listener; fall back to the config MOTD
+            String address = GeyserImpl.getInstance().config().logPlayerIpAddresses() ? inetSocketAddress.toString() : "<IP address withheld>";
+            GeyserImpl.getInstance().getLogger().debug("Timed out getting ping information for " + address);
+            return null;
         } catch (ExecutionException | InterruptedException e) {
             throw new RuntimeException(e);
         }

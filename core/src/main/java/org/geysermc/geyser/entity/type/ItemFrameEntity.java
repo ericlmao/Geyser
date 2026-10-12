@@ -81,8 +81,6 @@ public class ItemFrameEntity extends HangingEntity {
 
         blockDefinition = buildBlockDefinition(Direction.SOUTH); // Default to SOUTH direction, like on Java - entity metadata should correct this when necessary
         bedrockPosition = position().toInt();
-
-        session.getItemFrameCache().put(bedrockPosition, this);
     }
 
     @Override
@@ -93,6 +91,9 @@ public class ItemFrameEntity extends HangingEntity {
 
     @Override
     public void spawnEntity() {
+        // Registered here rather than in the constructor: spawnEntity only runs once the EntityCache accepted this
+        // entity, so a rejected duplicate Java id can no longer replace the live frame's mapping
+        session.getItemFrameCache().put(bedrockPosition, this);
         updateBlock(true);
         session.getGeyser().getLogger().debug("Spawned item frame at location " + bedrockPosition + " with java id " + entityId);
         valid = true;

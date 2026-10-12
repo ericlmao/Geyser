@@ -28,7 +28,7 @@ package org.geysermc.geyser.util;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
-import com.google.gson.JsonSyntaxException;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import org.geysermc.floodgate.news.NewsItem;
 import org.geysermc.floodgate.news.NewsItemAction;
 import org.geysermc.floodgate.news.data.AnnouncementData;
@@ -40,53 +40,60 @@ import org.geysermc.geyser.GeyserLogger;
 import org.geysermc.geyser.session.GeyserSession;
 import org.geysermc.geyser.text.ChatColor;
 
-import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class NewsHandler {
-    private final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
+    private final ScheduledThreadPoolExecutor executorService;
     private final GeyserLogger logger = GeyserImpl.getInstance().getLogger();
     private final Gson gson = new Gson();
 
-    private final Map<Integer, NewsItem> activeNewsItems = new HashMap<>();
+    private final Map<Integer, NewsItem> activeNewsItems = new ConcurrentHashMap<>();
     private final String branch;
     private final int build;
 
-    private boolean firstCheck = true;
+    private volatile boolean firstCheck = true;
 
     public NewsHandler(String branch, int build) {
         this.branch = branch;
         this.build = build;
 
+        this.executorService = new ScheduledThreadPoolExecutor(1, new DefaultThreadFactory("Geyser News Checker", true));
+        // Don't let a pending CHECK_AFTER one-shot keep the thread alive (and hit the network) after shutdown
+        this.executorService.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
+
         executorService.scheduleWithFixedDelay(this::checkNews, 0, 30, TimeUnit.MINUTES);
     }
 
     private void schedule(long delayMs) {
-        executorService.schedule(this::checkNews, delayMs, TimeUnit.MILLISECONDS);
+        if (!executorService.isShutdown()) {
+            executorService.schedule(this::checkNews, delayMs, TimeUnit.MILLISECONDS);
+        }
     }
 
     private void checkNews() {
+        // Anything escaping here would cancel the periodic task for good
         try {
             String body = WebUtils.getBody(Constants.NEWS_OVERVIEW_URL + Constants.NEWS_PROJECT_NAME);
             JsonArray array = gson.fromJson(body, JsonArray.class);
+            if (array == null) {
+                return;
+            }
 
-            try {
-                for (JsonElement newsItemElement : array) {
-                    NewsItem newsItem = NewsItem.readItem(newsItemElement.getAsJsonObject());
-                    if (newsItem != null) {
-                        addNews(newsItem);
-                    }
-                }
-                firstCheck = false;
-            } catch (Exception e) {
-                if (logger.isDebug()) {
-                    logger.error("Error while reading news item", e);
+            for (JsonElement newsItemElement : array) {
+                NewsItem newsItem = NewsItem.readItem(newsItemElement.getAsJsonObject());
+                if (newsItem != null) {
+                    addNews(newsItem);
                 }
             }
-        } catch (IOException | JsonSyntaxException ignored) {}
+            firstCheck = false;
+        } catch (Exception e) {
+            if (logger.isDebug()) {
+                logger.error("Error while checking news", e);
+            }
+        }
     }
 
     public void handleNews(GeyserSession session, NewsItemAction action) {
@@ -113,7 +120,7 @@ public class NewsHandler {
             case BROADCAST_TO_OPERATORS:
                 for (GeyserSession player : GeyserImpl.getInstance().getSessionManager().getSessions().values()) {
                     if (player.getOpPermissionLevel() >= 2) {
-                        session.sendMessage(ChatColor.GREEN + news.getMessage());
+                        player.sendMessage(ChatColor.GREEN + news.getMessage());
                     }
                 }
                 break;
@@ -159,7 +166,7 @@ public class NewsHandler {
                 break;
             case CHECK_AFTER:
                 long checkAfter = item.getDataAs(CheckAfterData.class).getCheckAfter();
-                long delayMs = System.currentTimeMillis() - checkAfter;
+                long delayMs = checkAfter - System.currentTimeMillis();
                 schedule(delayMs > 0 ? delayMs : 0);
                 break;
             case CONFIG_SPECIFIC:

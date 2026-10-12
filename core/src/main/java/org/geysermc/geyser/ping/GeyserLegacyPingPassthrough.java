@@ -44,11 +44,20 @@ import java.net.ConnectException;
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 
 public class GeyserLegacyPingPassthrough extends Thread implements IGeyserPingPassthrough, Runnable {
     private static final byte[] HAPROXY_BINARY_PREFIX = new byte[]{13, 10, 13, 10, 0, 13, 10, 81, 85, 73, 84, 10};
+    /**
+     * Connect and read timeout for a single status exchange.
+     */
+    static final int TIMEOUT_MILLIS = 5000;
+    /**
+     * Upper bound for the remote-supplied status payload length. A status JSON with a 64x64 favicon is ~10 KB.
+     */
+    static final int MAX_STATUS_BYTES = 1 << 20;
 
     private final GeyserImpl geyser;
     private final long interval;
@@ -58,9 +67,14 @@ public class GeyserLegacyPingPassthrough extends Thread implements IGeyserPingPa
         this.interval = interval * 1000L;
     }
 
-    private GeyserPingInfo pingInfo;
+    private volatile GeyserPingInfo pingInfo;
 
     private volatile boolean shutdown;
+
+    /**
+     * The socket of the in-flight status exchange, so {@link #shutdown()} can close it and unblock a pending read.
+     */
+    private volatile Socket current;
 
     /**
      * Start legacy ping passthrough thread
@@ -89,67 +103,23 @@ public class GeyserLegacyPingPassthrough extends Thread implements IGeyserPingPa
     public void shutdown() {
         shutdown = true;
         this.interrupt();
+        // Socket reads are not interruptible; closing the socket makes a blocked read fail immediately,
+        // so this thread does not keep the old GeyserImpl alive across a reload.
+        Socket socket = current;
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     @Override
     public void run() {
-        while (!geyser.isShuttingDown() && !shutdown) {
-            try (Socket socket = new Socket()) {
-                String address = geyser.config().java().address();
-                int port = geyser.config().java().port();
-                InetSocketAddress endpoint = new InetSocketAddress(address, port);
-                socket.connect(endpoint, 5000);
-
-                ByteArrayOutputStream byteArrayStream = new ByteArrayOutputStream();
-                try (DataOutputStream handshake = new DataOutputStream(byteArrayStream)) {
-                    handshake.write(0x0);
-                    VarInts.writeUnsignedInt(handshake, GameProtocol.getJavaProtocolVersion());
-                    VarInts.writeUnsignedInt(handshake, address.length());
-                    handshake.writeBytes(address);
-                    handshake.writeShort(port);
-                    VarInts.writeUnsignedInt(handshake, 1);
-                }
-
-                byte[] buffer;
-
-                try (DataOutputStream dataOutputStream = new DataOutputStream(socket.getOutputStream())) {
-                    if (geyser.config().advanced().java().useHaproxyProtocol()) {
-                        // HAProxy support
-                        // Based on https://github.com/netty/netty/blob/d8ad931488f6b942dabe28ecd6c399b4438da0a8/codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessageEncoder.java#L78
-                        dataOutputStream.write(HAPROXY_BINARY_PREFIX);
-                        dataOutputStream.writeByte((0x02 << 4) | HAProxyCommand.PROXY.byteValue());
-                        dataOutputStream.writeByte(socket.getLocalAddress() instanceof Inet4Address ?
-                            HAProxyProxiedProtocol.TCP4.byteValue() : HAProxyProxiedProtocol.TCP6.byteValue());
-                        byte[] srcAddrBytes = NetUtil.createByteArrayFromIpAddressString(
-                            ((InetSocketAddress) socket.getLocalSocketAddress()).getAddress().getHostAddress());
-                        byte[] dstAddrBytes = NetUtil.createByteArrayFromIpAddressString(
-                            endpoint.getAddress().getHostAddress());
-                        dataOutputStream.writeShort(srcAddrBytes.length + dstAddrBytes.length + 4);
-                        dataOutputStream.write(srcAddrBytes);
-                        dataOutputStream.write(dstAddrBytes);
-                        dataOutputStream.writeShort(((InetSocketAddress) socket.getLocalSocketAddress()).getPort());
-                        dataOutputStream.writeShort(port);
-                    }
-
-                    VarInts.writeUnsignedInt(dataOutputStream, byteArrayStream.size());
-                    dataOutputStream.write(byteArrayStream.toByteArray());
-                    dataOutputStream.writeByte(0x01);
-                    dataOutputStream.writeByte(0x00);
-
-                    try (DataInputStream dataInputStream = new DataInputStream(socket.getInputStream())) {
-                        VarInts.readUnsignedInt(dataInputStream);
-                        VarInts.readUnsignedInt(dataInputStream);
-                        int length = VarInts.readUnsignedInt(dataInputStream);
-                        buffer = new byte[length];
-                        dataInputStream.readFully(buffer);
-                        dataOutputStream.writeByte(0x09);
-                        dataOutputStream.writeByte(0x01);
-                        dataOutputStream.writeLong(System.currentTimeMillis());
-
-                        VarInts.readUnsignedInt(dataInputStream);
-                    }
-                }
-
+        while (!geyser.isShuttingDown() && !shutdown && !this.isInterrupted()) {
+            try {
+                byte[] buffer = pingOnce(geyser.config().java().address(), geyser.config().java().port(),
+                    geyser.config().advanced().java().useHaproxyProtocol());
                 this.pingInfo = JsonUtils.fromJson(buffer, GeyserPingInfo.class);
             } catch (SocketTimeoutException | ConnectException ex) {
                 this.pingInfo = null;
@@ -162,8 +132,17 @@ public class GeyserLegacyPingPassthrough extends Thread implements IGeyserPingPa
             } catch (UnknownHostException ex) {
                 // Don't reset pingInfo, as we want to keep the last known value
                 this.geyser.getLogger().warning("Unable to resolve remote host! Is the remote server down or invalid?");
+            } catch (SocketException e) {
+                if (shutdown) {
+                    // Socket was closed by shutdown()
+                    break;
+                }
+                this.geyser.getLogger().error("IO error while trying to use legacy ping passthrough", e);
             } catch (IOException e) {
                 this.geyser.getLogger().error("IO error while trying to use legacy ping passthrough", e);
+            } catch (Exception e) {
+                // Keep the thread alive on a malformed reply; otherwise pingInfo would be frozen forever
+                this.geyser.getLogger().error("Ping passthrough failed", e);
             }
 
             try {
@@ -171,6 +150,83 @@ public class GeyserLegacyPingPassthrough extends Thread implements IGeyserPingPa
             } catch (InterruptedException ex) {
                 // no-op
             }
+        }
+    }
+
+    /**
+     * Performs a single Java status exchange with the given server.
+     *
+     * @return the raw status JSON
+     * @throws SocketTimeoutException if the server does not answer within {@link #TIMEOUT_MILLIS}
+     * @throws IOException on any other network error, or if the server announces an unreasonable payload length
+     */
+    byte[] pingOnce(String address, int port, boolean useHaproxyProtocol) throws IOException {
+        try (Socket socket = new Socket()) {
+            current = socket;
+            if (shutdown) {
+                // shutdown() may have run before current was published
+                socket.close();
+            }
+            InetSocketAddress endpoint = new InetSocketAddress(address, port);
+            socket.connect(endpoint, TIMEOUT_MILLIS);
+            socket.setSoTimeout(TIMEOUT_MILLIS);
+
+            ByteArrayOutputStream byteArrayStream = new ByteArrayOutputStream();
+            try (DataOutputStream handshake = new DataOutputStream(byteArrayStream)) {
+                handshake.write(0x0);
+                VarInts.writeUnsignedInt(handshake, GameProtocol.getJavaProtocolVersion());
+                VarInts.writeUnsignedInt(handshake, address.length());
+                handshake.writeBytes(address);
+                handshake.writeShort(port);
+                VarInts.writeUnsignedInt(handshake, 1);
+            }
+
+            byte[] buffer;
+
+            try (DataOutputStream dataOutputStream = new DataOutputStream(socket.getOutputStream())) {
+                if (useHaproxyProtocol) {
+                    // HAProxy support
+                    // Based on https://github.com/netty/netty/blob/d8ad931488f6b942dabe28ecd6c399b4438da0a8/codec-haproxy/src/main/java/io/netty/handler/codec/haproxy/HAProxyMessageEncoder.java#L78
+                    dataOutputStream.write(HAPROXY_BINARY_PREFIX);
+                    dataOutputStream.writeByte((0x02 << 4) | HAProxyCommand.PROXY.byteValue());
+                    dataOutputStream.writeByte(socket.getLocalAddress() instanceof Inet4Address ?
+                        HAProxyProxiedProtocol.TCP4.byteValue() : HAProxyProxiedProtocol.TCP6.byteValue());
+                    byte[] srcAddrBytes = NetUtil.createByteArrayFromIpAddressString(
+                        ((InetSocketAddress) socket.getLocalSocketAddress()).getAddress().getHostAddress());
+                    byte[] dstAddrBytes = NetUtil.createByteArrayFromIpAddressString(
+                        endpoint.getAddress().getHostAddress());
+                    dataOutputStream.writeShort(srcAddrBytes.length + dstAddrBytes.length + 4);
+                    dataOutputStream.write(srcAddrBytes);
+                    dataOutputStream.write(dstAddrBytes);
+                    dataOutputStream.writeShort(((InetSocketAddress) socket.getLocalSocketAddress()).getPort());
+                    dataOutputStream.writeShort(port);
+                }
+
+                VarInts.writeUnsignedInt(dataOutputStream, byteArrayStream.size());
+                dataOutputStream.write(byteArrayStream.toByteArray());
+                dataOutputStream.writeByte(0x01);
+                dataOutputStream.writeByte(0x00);
+
+                try (DataInputStream dataInputStream = new DataInputStream(socket.getInputStream())) {
+                    VarInts.readUnsignedInt(dataInputStream);
+                    VarInts.readUnsignedInt(dataInputStream);
+                    int length = VarInts.readUnsignedInt(dataInputStream);
+                    if (length < 0 || length > MAX_STATUS_BYTES) {
+                        throw new IOException("Unreasonable status length " + Integer.toUnsignedString(length));
+                    }
+                    buffer = new byte[length];
+                    dataInputStream.readFully(buffer);
+                    dataOutputStream.writeByte(0x09);
+                    dataOutputStream.writeByte(0x01);
+                    dataOutputStream.writeLong(System.currentTimeMillis());
+
+                    VarInts.readUnsignedInt(dataInputStream);
+                }
+            }
+
+            return buffer;
+        } finally {
+            current = null;
         }
     }
 }

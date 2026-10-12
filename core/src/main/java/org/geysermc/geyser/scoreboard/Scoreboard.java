@@ -160,12 +160,16 @@ public final class Scoreboard {
 
         var display = objectiveSlots.get(slot);
         if (display != null) {
-            // The replaced display slot must be detached from its objective, even if the same objective is displayed again.
-            // Otherwise it keeps receiving (and holding on to) every new score for as long as the objective exists.
-            display.objective().removeDisplaySlot(display);
-            if (display.objective() != objective) {
-                removedSlots.add(display);
+            if (display.objective() == objective) {
+                // matches vanilla behaviour: re-displaying the same objective in the same slot changes nothing.
+                // Creating a new display slot would give it a new Bedrock objective id, leaving the old one on the client.
+                return;
             }
+            // The replaced display slot must be detached from its objective, otherwise it keeps receiving (and holding on to)
+            // every new score for as long as the objective exists. It must also always be removed, so that its Bedrock
+            // objective id is removed from the client.
+            display.objective().removeDisplaySlot(display);
+            removedSlots.add(display);
         }
 
         display = switch (DisplaySlot.slotCategory(slot)) {

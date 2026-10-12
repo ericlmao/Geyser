@@ -69,10 +69,16 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
 
         // Hacky fix, see below
         Set<GeyserShapelessRecipe.FurnaceRecipeType> knownFurnaceRecipes = new HashSet<>();
+        // Whether the crafting data packet contains any recipe definitions the client does not have yet
+        boolean hasNewDefinitions = false;
 
         for (ClientboundRecipeBookAddPacket.Entry entry : packet.getEntries()) {
             RecipeDisplayEntry contents = entry.contents();
-            if (javaToBedrockRecipeIds.containsKey(contents.id())) {
+            List<String> knownBedrockRecipeIds = javaToBedrockRecipeIds.get(contents.id());
+            if (knownBedrockRecipeIds != null) {
+                // The Bedrock client already has the definitions; this recipe may have been removed (locked) before,
+                // so unlock it again instead of skipping it.
+                recipesPacket.getUnlockedRecipes().addAll(knownBedrockRecipeIds);
                 continue;
             }
 
@@ -99,6 +105,7 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
                     geyserRecipes.put(netId++, geyserRecipe);
                 }
                 javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                hasNewDefinitions = true;
                 continue;
             }
 
@@ -121,6 +128,7 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
                         geyserRecipes.put(netId++, geyserRecipe);
                     }
                     javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                    hasNewDefinitions = true;
                 }
                 case ShapelessCraftingRecipeDisplay shapelessRecipe -> {
                     GeyserShapelessRecipe geyserRecipe = new GeyserShapelessRecipe(contents.id(), netId, shapelessRecipe);
@@ -140,6 +148,7 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
                         geyserRecipes.put(netId++, geyserRecipe);
                     }
                     javaToBedrockRecipeIds.put(contents.id(), List.copyOf(bedrockRecipeIds));
+                    hasNewDefinitions = true;
                 }
                 case SmithingRecipeDisplay smithingRecipe -> {
                     if (contents.display().result() instanceof SmithingTrimDemoSlotDisplay) {
@@ -158,6 +167,9 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
                     }
 
                     netId += recipeData.size();
+                    // Smithing recipes are not (un)lockable on Bedrock, but record them so re-sent entries are not duplicated
+                    javaToBedrockRecipeIds.put(contents.id(), List.of());
+                    hasNewDefinitions = true;
                 }
                 default -> {
                     GeyserImpl.getInstance().getLogger().debug("Ignoring unknown recipe display type! " + entry);
@@ -169,7 +181,9 @@ public class JavaRecipeBookAddTranslator extends PacketTranslator<ClientboundRec
             // Sending an empty list here will crash the client as of 1.20.60
             // This was definitely in the codebase the entire time and did not
             // accidentally get refactored out during Java 1.21.3. :)
-            session.sendUpstreamPacket(craftingDataPacket);
+            if (hasNewDefinitions) {
+                session.sendUpstreamPacket(craftingDataPacket);
+            }
             session.sendUpstreamPacket(recipesPacket);
         }
         session.getLastRecipeNetId().set(netId);

@@ -73,7 +73,8 @@ public class BelownameDisplaySlot extends DisplaySlot {
         }
 
         synchronized (displayScores) {
-            for (var score : displayScores.values()) {
+            for (var iterator = displayScores.values().iterator(); iterator.hasNext(); ) {
+                var score = iterator.next();
                 // we don't have to worry about a score not existing, because that's handled by both
                 // this method when an objective is added and addScore/playerRegistered.
                 // we only have to update them, if they have changed
@@ -89,6 +90,10 @@ public class BelownameDisplaySlot extends DisplaySlot {
 
                 if (score.referenceRemoved()) {
                     setBelowNameText(score.player(), null);
+                    // the score no longer exists, so stop tracking it. Otherwise it'd be updated every cycle,
+                    // and keep the player entity and score reference around until the player is removed.
+                    // A new score for this player will be added through addScore.
+                    iterator.remove();
                     continue;
                 }
 

@@ -244,6 +244,14 @@ public final class WorldCache {
         return this.activeRecords.remove(pos);
     }
 
+    /**
+     * Forgets all tracked records; used on dimension switch, where the positions no longer apply.
+     */
+    public void clearRecords() {
+        this.activeRecords.clear();
+        this.playingRecords.clear();
+    }
+
     public void setCooldown(Key cooldownGroup, int ticks) {
         if (ticks == 0) {
             // As of Java 1.21
