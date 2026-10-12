@@ -25,6 +25,7 @@
 
 package org.geysermc.geyser.session;
 
+import io.netty.util.ReferenceCountUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -43,18 +44,36 @@ public class UpstreamSession {
     @Getter private final BedrockServerSession session;
     @Getter @Setter
     private boolean initialized = false;
+    /**
+     * Null once sent or released. Guarded by this, as the session may be disconnected from another thread.
+     */
     private Queue<BedrockPacket> postStartGamePackets = new ArrayDeque<>();
+    /**
+     * Whether {@link #release()} was called. Guarded by this.
+     */
+    private boolean released;
 
+    /**
+     * Sends a packet, or releases it if the session is closed. Either way, the caller no longer owns the packet.
+     */
     public void sendPacket(@NonNull BedrockPacket packet) {
-        if (!isClosed()) {
-            session.sendPacket(packet);
+        if (isClosed()) {
+            ReferenceCountUtil.safeRelease(packet);
+            return;
         }
+        session.sendPacket(packet);
     }
 
+    /**
+     * Sends a packet immediately, or releases it if the session is closed. Either way, the caller no longer owns the
+     * packet.
+     */
     public void sendPacketImmediately(@NonNull BedrockPacket packet) {
-        if (!isClosed()) {
-            session.sendPacketImmediately(packet);
+        if (isClosed()) {
+            ReferenceCountUtil.safeRelease(packet);
+            return;
         }
+        session.sendPacketImmediately(packet);
     }
 
     public void disconnect(String reason) {
@@ -64,18 +83,47 @@ public class UpstreamSession {
     /**
      * Queue a packet that must be delayed until after login.
      */
-    public void queuePostStartGamePacket(BedrockPacket packet) {
+    public synchronized void queuePostStartGamePacket(BedrockPacket packet) {
+        if (released) {
+            ReferenceCountUtil.safeRelease(packet);
+            return;
+        }
+        if (postStartGamePackets == null) {
+            // Already sent, so there is no reason to wait
+            sendPacket(packet);
+            return;
+        }
         postStartGamePackets.add(packet);
     }
 
-    public void sendPostStartGamePackets() {
+    public synchronized void sendPostStartGamePackets() {
         if (isClosed()) {
+            release();
+            return;
+        }
+        if (postStartGamePackets == null) {
             return;
         }
 
         BedrockPacket packet;
         while ((packet = postStartGamePackets.poll()) != null) {
-            session.sendPacket(packet);
+            sendPacket(packet);
+        }
+        postStartGamePackets = null;
+    }
+
+    /**
+     * Releases the packets that were queued for after the start game packet and not sent yet. Called when the
+     * session is disconnected; packets queued afterwards are dropped.
+     */
+    public synchronized void release() {
+        released = true;
+        if (postStartGamePackets == null) {
+            return;
+        }
+        BedrockPacket packet;
+        while ((packet = postStartGamePackets.poll()) != null) {
+            ReferenceCountUtil.safeRelease(packet);
         }
         postStartGamePackets = null;
     }
