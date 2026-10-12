@@ -61,6 +61,10 @@ public abstract class GeyserServerInitializer extends BedrockServerInitializer {
             GeyserSession session = new GeyserSession(this.geyser, bedrockServerSession, this.eventLoopGroup.next());
 
             if (!bedrockServerSession.isSubClient()) {
+                if (bedrockServerSession.getPeer() instanceof GeyserBedrockPeer peer) {
+                    // Stops the session on its own thread when the connection is aborted from elsewhere
+                    peer.setTerminalListener(session::onTransportTerminal);
+                }
                 Channel channel = bedrockServerSession.getPeer().getChannel();
                 // Added after BedrockPeer, not BedrockPacketCodec to ensure exceptions thrown while dispatching
                 // to the packet handler also get here if no other handler exists
@@ -78,6 +82,6 @@ public abstract class GeyserServerInitializer extends BedrockServerInitializer {
 
     @Override
     protected BedrockPeer createPeer(Channel channel) {
-        return new GeyserBedrockPeer(channel, this::createSession);
+        return new GeyserBedrockPeer(channel, this::createSession, this.geyser.getOutboundPolicy(), this.geyser.getTransportMonitor());
     }
 }

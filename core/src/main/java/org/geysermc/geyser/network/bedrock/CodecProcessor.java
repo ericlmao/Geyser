@@ -297,11 +297,16 @@ public class CodecProcessor {
         }
     };
 
+    /**
+     * Must stay below every serializer constant, as processCodec reads them during static init.
+     */
+    static final BedrockCodec LEGACY_1_26_40_CODEC = processCodec(Bedrock_v2168.CODEC);
+
     public static void updateCodec(UpstreamSession upstreamSession, String version) {
         // Support all older 1.26.4x builds
         switch (version) {
             case "1.26.40", "1.26.41", "1.26.42", "1.26.43" -> {
-                upstreamSession.getSession().setCodec(processCodec(Bedrock_v2168.CODEC));
+                upstreamSession.getSession().setCodec(LEGACY_1_26_40_CODEC);
             }
         }
     }

@@ -26,8 +26,11 @@
 package org.geysermc.geyser.network.bedrock.nethernet;
 
 import io.netty.channel.Channel;
+import org.checkerframework.checker.nullness.qual.Nullable;
+import org.cloudburstmc.protocol.bedrock.BedrockOutboundPolicy;
 import org.cloudburstmc.protocol.bedrock.BedrockSessionFactory;
 import org.geysermc.geyser.network.bedrock.GeyserBedrockPeer;
+import org.geysermc.geyser.network.bedrock.TransportMonitor;
 
 import javax.crypto.SecretKey;
 
@@ -37,8 +40,9 @@ public class NetherNetPeer extends GeyserBedrockPeer {
      */
     private static final int EQUIVALENT_RAK_VERSION = 11;
 
-    public NetherNetPeer(Channel channel, BedrockSessionFactory sessionFactory) {
-        super(channel, sessionFactory);
+    public NetherNetPeer(Channel channel, BedrockSessionFactory sessionFactory, BedrockOutboundPolicy outboundPolicy,
+                         @Nullable TransportMonitor monitor) {
+        super(channel, sessionFactory, outboundPolicy, monitor);
     }
 
     @Override

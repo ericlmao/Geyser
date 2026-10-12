@@ -262,6 +262,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -1302,6 +1303,23 @@ public class GeyserSession implements GeyserConnection, GeyserCommandSource {
         }
 
         executeInEventLoop(runnable);
+    }
+
+    /**
+     * Called once, from any thread, when the Bedrock connection was aborted because its transport stopped making
+     * progress or exceeded its outbound limits. By then the connection no longer accepts packets, so the upstream
+     * counts as closed and Java packets are no longer translated; this disconnects the session on its own thread.
+     */
+    public void onTransportTerminal(String reason) {
+        try {
+            executeInEventLoop(() -> {
+                if (!closed) {
+                    disconnect(reason);
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // The session's event loop is shutting down, so nothing is left to stop
+        }
     }
 
     /**
